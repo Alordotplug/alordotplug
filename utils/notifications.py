@@ -11,7 +11,8 @@ from telegram.ext import ContextTypes
 from telegram.error import TelegramError, Forbidden
 
 from database import Database
-from utils.categories import get_category_display_name, NOTIFICATION_EXCLUDED_CATEGORIES
+from utils.categories import get_category_display_name, get_subcategory_display_name, NOTIFICATION_EXCLUDED_CATEGORIES
+from translations.translator import translate_text
 
 logger = logging.getLogger(__name__)
 
@@ -220,15 +221,28 @@ class NotificationService:
                     await self.db.mark_notification_sent(notification_id)
                     continue
                 
+                # Get user's language preference
+                user_lang = await self.db.get_user_language(user_id)
+                
                 # Prepare notification message
                 category = product.get("category", "Unknown")
                 subcategory = product.get("subcategory")
                 
                 category_text = get_category_display_name(category)
                 if subcategory:
-                    category_text += f" • {subcategory.title()}"
+                    translated_subcategory = get_subcategory_display_name(subcategory, user_lang)
+                    category_text += f" • {translated_subcategory}"
                 
                 caption = product.get("caption", "")
+                
+                # Translate caption if user language is not English
+                if user_lang and user_lang not in ["en", "en-US"] and caption:
+                    try:
+                        caption = translate_text(caption, user_lang)
+                    except Exception as e:
+                        logger.error(f"Error translating caption for notification: {e}")
+                        # Keep original caption if translation fails
+                
                 caption_preview = caption[:100] + "..." if len(caption) > 100 else caption
                 
                 message_text = (

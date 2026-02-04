@@ -2,12 +2,11 @@
 Start command handler.
 """
 import logging
-from typing import Optional
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
-
 from database import Database
+from translations.translator import get_translated_string
+from translations.language_config import LANGUAGE_DISPLAY, DEFAULT_LANGUAGE
 
 logger = logging.getLogger(__name__)
 db = Database()
@@ -15,129 +14,136 @@ db = Database()
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
-    try:
-        user = update.effective_user
-        if not user:
-            # Defensive: if no user info, just acknowledge
-            await (update.effective_message or update.callback_query.message).reply_text(
-                "Hello! How can I help you?"
-            )
-            return
+    user = update.effective_user
+    
+    # Check if this is a new user (doesn't exist in database)
+    is_new_user = not await db.user_exists(user.id)
+    
+    # Track user
+    await db.track_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name
+    )
+    
+    # For new users, show language selection menu
+    if is_new_user:
+        await show_language_selection(update, context)
+        return
+    
+    # For existing users, show normal welcome message
+    await show_welcome_message(update, context)
 
-        # Track user (username/first/last may be None)
-        await db.track_user(
-            user_id=user.id,
-            username=getattr(user, "username", None),
-            first_name=getattr(user, "first_name", None),
-            last_name=getattr(user, "last_name", None),
+
+async def show_language_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show language selection menu for new users."""
+    user = update.effective_user
+    
+    # Create language selection keyboard
+    keyboard_buttons = []
+    for lang_code, display_name in LANGUAGE_DISPLAY.items():
+        keyboard_buttons.append([
+            InlineKeyboardButton(display_name, callback_data=f"setlang_start|{lang_code}")
+        ])
+    
+    keyboard = InlineKeyboardMarkup(keyboard_buttons)
+    
+    # Use English as default for initial message
+    welcome_text = f"👋 Welcome, {user.first_name}!\n\n"
+    welcome_text += "🌐 **Select Your Language / Choisissez votre langue / Wählen Sie Ihre Sprache**\n\n"
+    welcome_text += "Please select your preferred language to continue:"
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    logger.info(f"New user {user.id} - showing language selection")
+
+
+async def show_welcome_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show welcome message for existing users."""
+    user = update.effective_user
+    
+    # Get user's language preference
+    user_lang = await db.get_user_language(user.id)
+    
+    # Check if user is subscribed to notifications
+    is_subscribed = await db.is_user_subscribed(user.id)
+    
+    # Get translated welcome message
+    welcome_text = get_translated_string("welcome", user_lang, name=user.first_name)
+    
+    # Build keyboard based on subscription status
+    view_catalog_text = get_translated_string("view_catalog", user_lang)
+    change_language_text = get_translated_string("change_language", user_lang)
+    keyboard_buttons = [
+        [InlineKeyboardButton(view_catalog_text, callback_data="categories")],
+        [InlineKeyboardButton(change_language_text, callback_data="open_language_settings")]
+    ]
+    
+    # Add resubscribe button only for users who have unsubscribed
+    if not is_subscribed:
+        resubscribe_text = get_translated_string("resubscribe_notifications", user_lang)
+        keyboard_buttons.append(
+            [InlineKeyboardButton(resubscribe_text, callback_data="toggle_notifications")]
         )
-
-        # Check subscription status
-        is_subscribed = await db.is_user_subscribed(user.id)
-
-        welcome_text = (
-            f"👋 Welcome, {user.first_name or ''}!\n\n"
-            "I'm your media product catalog bot. I help you browse and search "
-            "products from our catalog.\n\n"
-            "Use /menu to view all products or simply type what you're looking for!\n\n"
-            "DM @OTplug_Ghost TO ORDER"
-        )
-
-        keyboard_buttons = [[InlineKeyboardButton("📋 View Catalog", callback_data="categories")]]
-
-        # Add resubscribe button only for users who have unsubscribed
-        if not is_subscribed:
-            keyboard_buttons.append(
-                [InlineKeyboardButton("🔔 Resubscribe to Notifications", callback_data="toggle_notifications")]
-            )
-
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-
-        # Send plain text (no parse_mode) to avoid entity parsing issues with user names
-        if update.effective_message:
-            await update.effective_message.reply_text(welcome_text, reply_markup=keyboard)
-        else:
-            # fallback
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_text, reply_markup=keyboard)
-
-        logger.info(f"User {user.id} started the bot")
-    except Exception as e:
-        logger.exception("Error in start_command: %s", e)
-        try:
-            if update.effective_message:
-                await update.effective_message.reply_text("❌ An error occurred while processing /start")
-            else:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ An error occurred while processing /start")
-        except Exception:
-            logger.exception("Failed to notify user after start_command error")
+    
+    keyboard = InlineKeyboardMarkup(keyboard_buttons)
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    logger.info(f"User {user.id} started the bot (language: {user_lang})")
 
 
 async def subscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /subscribe command - enable product notifications."""
-    try:
-        user = update.effective_user
-        if not user:
-            return
-
-        user_id = user.id
-
-        # Track user
-        await db.track_user(
-            user_id=user_id,
-            username=getattr(user, "username", None),
-            first_name=getattr(user, "first_name", None),
-            last_name=getattr(user, "last_name", None),
-        )
-
-        # Enable notifications
-        await db.set_user_notifications(user_id, True)
-
-        # Send plain text to avoid markdown parsing issues
-        await (update.effective_message or context.bot.send_message)(
-            chat_id=update.effective_chat.id,
-            text=(
-                "🔔 Notifications Enabled!\n\n"
-                "You will now receive notifications when new products are added to the catalog.\n\n"
-                "Use /unsubscribe to stop receiving notifications."
-            ),
-        )
-
-        logger.info(f"User {user_id} subscribed to notifications")
-    except Exception as e:
-        logger.exception("Error in subscribe_command: %s", e)
-        try:
-            if update.effective_message:
-                await update.effective_message.reply_text("❌ Failed to enable notifications")
-        except Exception:
-            logger.exception("Failed to notify user after subscribe_command error")
+    user_id = update.effective_user.id
+    
+    # Track user
+    await db.track_user(
+        user_id=user_id,
+        username=update.effective_user.username,
+        first_name=update.effective_user.first_name,
+        last_name=update.effective_user.last_name
+    )
+    
+    # Get user's language preference
+    user_lang = await db.get_user_language(user_id)
+    
+    # Enable notifications
+    await db.set_user_notifications(user_id, True)
+    
+    # Get translated message
+    message_text = get_translated_string("notifications_enabled", user_lang)
+    
+    await update.message.reply_text(
+        message_text,
+        parse_mode="Markdown"
+    )
+    logger.info(f"User {user_id} subscribed to notifications")
 
 
 async def unsubscribe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /unsubscribe command - disable product notifications."""
-    try:
-        user = update.effective_user
-        if not user:
-            return
+    user_id = update.effective_user.id
+    
+    # Get user's language preference
+    user_lang = await db.get_user_language(user_id)
+    
+    # Disable notifications
+    await db.set_user_notifications(user_id, False)
+    
+    # Get translated message
+    message_text = get_translated_string("notifications_disabled", user_lang)
+    
+    await update.message.reply_text(
+        message_text,
+        parse_mode="Markdown"
+    )
+    logger.info(f"User {user_id} unsubscribed from notifications")
 
-        user_id = user.id
-
-        # Disable notifications
-        await db.set_user_notifications(user_id, False)
-
-        await (update.effective_message or context.bot.send_message)(
-            chat_id=update.effective_chat.id,
-            text=(
-                "🔕 Notifications Disabled\n\n"
-                "You will no longer receive notifications about new products.\n\n"
-                "Use /subscribe to enable notifications again."
-            ),
-        )
-
-        logger.info(f"User {user_id} unsubscribed from notifications")
-    except Exception as e:
-        logger.exception("Error in unsubscribe_command: %s", e)
-        try:
-            if update.effective_message:
-                await update.effective_message.reply_text("❌ Failed to disable notifications")
-        except Exception:
-            logger.exception("Failed to notify user after unsubscribe_command error")

@@ -6,7 +6,7 @@ import asyncio
 import json
 import aiosqlite
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,17 +17,20 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-from config import Config, ConfigError
+from configs.config import Config, ConfigError
 from database import Database
 from handlers.start import start_command, subscribe_command, unsubscribe_command
 from handlers.menu import menu_command, show_catalog_page, handle_catalog_pagination
 from handlers.search import handle_search, show_search_results, handle_search_pagination
 from handlers.product_view import show_product, handle_product_callback
+from handlers.language import language_command, handle_language_callback
 from handlers.admin import (
     stats_command, delete_product, nuke_command, recategorize_command, 
     users_command, show_users_page,
     block_command, unblock_command, send_command, broadcast_command
 )
+from translations.language_config import is_valid_language, LANGUAGE_DISPLAY
+from translations.translator import get_translated_string
 from utils.helpers import (
     get_file_id_and_type,
     has_media,
@@ -36,7 +39,7 @@ from utils.helpers import (
     get_admin_ids,
     is_admin
 )
-from utils.categories import get_all_categories, get_category_display_name, get_subcategories, CATEGORIES
+from utils.categories import get_all_categories, get_category_display_name, get_subcategories, get_subcategory_display_name, CATEGORIES
 from utils.notifications import NotificationService
 
 # Configure logging with structured format for better visibility on Render
@@ -304,8 +307,190 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     callback_data = query.data
     
+    # Handle language selection callbacks from /language command
+    if callback_data.startswith("setlang|"):
+        parts = callback_data.split("|")
+        if len(parts) >= 2:
+            lang_code = parts[1]
+            await handle_language_callback(update, context, lang_code)
+            return
+    
+    # Handle opening language settings from start page
+    if callback_data == "open_language_settings":
+        # Get user's current language
+        current_lang = await db.get_user_language(user_id)
+        
+        # Create language selection keyboard
+        keyboard_buttons = []
+        for lang_code, display_name in LANGUAGE_DISPLAY.items():
+            # Add checkmark for current language
+            if lang_code == current_lang:
+                display_name = f"✓ {display_name}"
+            
+            keyboard_buttons.append([
+                InlineKeyboardButton(display_name, callback_data=f"setlang|{lang_code}")
+            ])
+        
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+        
+        # Get translated message
+        message_text = get_translated_string("language_settings", current_lang)
+        current_lang_name = LANGUAGE_DISPLAY.get(current_lang, LANGUAGE_DISPLAY["en"])
+        current_lang_text = get_translated_string(
+            "current_language", 
+            current_lang,
+            language=current_lang_name
+        )
+        
+        message_text += f"\n\n{current_lang_text}"
+        
+        # Check if we need to send new message or edit existing
+        message = query.message
+        if message.photo or message.video or message.document or message.animation or message.audio:
+            # Media message - send new text message
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=message_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        else:
+            # Text message - edit it
+            await query.edit_message_text(
+                message_text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        
+        logger.info(f"User {user_id} opened language settings from start page (current: {current_lang})")
+        return
+    
+    # Handle language selection callbacks from /start command (new users)
+    if callback_data.startswith("setlang_start|"):
+        parts = callback_data.split("|")
+        if len(parts) >= 2:
+            lang_code = parts[1]
+            
+            # Validate and set language
+            if is_valid_language(lang_code):
+                await db.set_user_language(user_id, lang_code)
+                # Answer the callback
+                await query.answer()
+                # Delete the language selection message
+                await query.delete_message()
+                
+                # Show welcome message in selected language
+                is_subscribed = await db.is_user_subscribed(user_id)
+                
+                welcome_text = get_translated_string("welcome", lang_code, name=update.effective_user.first_name)
+                view_catalog_text = get_translated_string("view_catalog", lang_code)
+                change_language_text = get_translated_string("change_language", lang_code)
+                keyboard_buttons = [
+                    [InlineKeyboardButton(view_catalog_text, callback_data="categories")],
+                    [InlineKeyboardButton(change_language_text, callback_data="open_language_settings")]
+                ]
+                
+                if not is_subscribed:
+                    resubscribe_text = get_translated_string("resubscribe_notifications", lang_code)
+                    keyboard_buttons.append(
+                        [InlineKeyboardButton(resubscribe_text, callback_data="toggle_notifications")]
+                    )
+                
+                keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=welcome_text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                logger.info(f"New user {user_id} selected language: {lang_code}")
+            else:
+                await query.answer("❌ Invalid language", show_alert=True)
+            return
+    
     # Handle noop (page indicator button)
     if callback_data == "noop":
+        return
+    
+    # Handle broadcast confirmations
+    if callback_data == "broadcast_cancel":
+        await query.edit_message_text("❌ Broadcast cancelled.")
+        context.user_data.clear()
+        return
+    
+    if callback_data.startswith("broadcast_confirm_single|"):
+        # Confirm and send single user broadcast
+        parts = callback_data.split("|")
+        if len(parts) >= 2:
+            target_user_id = int(parts[1])
+            message_text = context.user_data.get('broadcast_message')
+            
+            if not message_text:
+                await query.answer("❌ Message not found. Please start over.", show_alert=True)
+                context.user_data.clear()
+                return
+            
+            # Send the message
+            from utils.notifications import NotificationService
+            notification_service = NotificationService(db)
+            
+            success = await notification_service.send_custom_message_to_user(
+                context,
+                target_user_id,
+                message_text
+            )
+            
+            if success:
+                await query.edit_message_text(
+                    f"✅ **Message Sent Successfully!**\n\n"
+                    f"🆔 User ID: `{target_user_id}`\n"
+                    f"📝 Message: {message_text[:100]}{'...' if len(message_text) > 100 else ''}",
+                    parse_mode="Markdown"
+                )
+                logger.info(f"Admin {user_id} sent message to user {target_user_id}")
+            else:
+                await query.edit_message_text("❌ Failed to send message. Check logs for details.")
+            
+            context.user_data.clear()
+        return
+    
+    if callback_data == "broadcast_confirm_all":
+        # Confirm and send broadcast to all users
+        message_text = context.user_data.get('broadcast_message')
+        
+        if not message_text:
+            await query.answer("❌ Message not found. Please start over.", show_alert=True)
+            context.user_data.clear()
+            return
+        
+        # Send status message
+        await query.edit_message_text(
+            "📡 **Broadcasting message...**\n\n"
+            "Please wait while the message is queued for all users.",
+            parse_mode="Markdown"
+        )
+        
+        # Broadcast using notification service
+        from utils.notifications import NotificationService
+        notification_service = NotificationService(db)
+        
+        queued_count = await notification_service.broadcast_custom_message(
+            context,
+            message_text,
+            exclude_blocked=True
+        )
+        
+        await query.edit_message_text(
+            f"✅ **Broadcast Complete**\n\n"
+            f"📨 Messages queued: {queued_count}\n"
+            f"📝 Message: {message_text[:100]}{'...' if len(message_text) > 100 else ''}\n\n"
+            f"Messages will be delivered with rate-limiting intervals.",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Admin {user_id} broadcast message to {queued_count} users")
+        
+        context.user_data.clear()
         return
     
     # Handle categories menu
@@ -401,24 +586,40 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 # Check if this is a main category or we need subcategory
                 subcategories = get_subcategories(category)
                 
+                # Get user language preference
+                user_id = update.effective_user.id
+                user_lang = await db.get_user_language(user_id)
+                
                 if subcategories:
                     # Show subcategory selection
                     keyboard_buttons = []
                     for subcat in subcategories:
+                        # Get translated subcategory name
+                        translated_subcat = get_subcategory_display_name(subcat, user_lang)
                         keyboard_buttons.append([
-                            InlineKeyboardButton(subcat.title(), callback_data=f"setsubcat|{product_id}|{category}|{subcat}")
+                            InlineKeyboardButton(translated_subcat, callback_data=f"setsubcat|{product_id}|{category}|{subcat}")
                         ])
                     
                     # Add "No Subcategory" option
+                    save_without_text = get_translated_string("save_without_subcategory", user_lang)
                     keyboard_buttons.append([
-                        InlineKeyboardButton("✅ Save without subcategory", callback_data=f"savecat|{product_id}|{category}|")
+                        InlineKeyboardButton(save_without_text, callback_data=f"savecat|{product_id}|{category}|")
                     ])
                     
                     keyboard = InlineKeyboardMarkup(keyboard_buttons)
                     
+                    # Translate category name
+                    category_key = f"category_{category.lower()}"
+                    translated_category = get_translated_string(category_key, user_lang)
+                    if translated_category == category_key:
+                        translated_category = get_category_display_name(category)
+                    
+                    category_label = get_translated_string("category_label", user_lang, category=translated_category)
+                    select_or_save = get_translated_string("select_subcategory_or_save", user_lang)
+                    
                     await query.edit_message_text(
-                        f"📂 Category: {get_category_display_name(category)}\n\n"
-                        f"Select a subcategory or save without one:",
+                        f"{category_label}\n\n"
+                        f"{select_or_save}",
                         reply_markup=keyboard
                     )
                 else:
@@ -439,6 +640,22 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 category = parts[2]
                 subcategory = parts[3]
                 
+                # Get user language preference
+                user_id = update.effective_user.id
+                user_lang = await db.get_user_language(user_id)
+                
+                # Translate category name
+                category_key = f"category_{category.lower()}"
+                translated_category = get_translated_string(category_key, user_lang)
+                if translated_category == category_key:
+                    translated_category = get_category_display_name(category)
+                
+                # Translate strings
+                translated_subcat = get_subcategory_display_name(subcategory, user_lang)
+                category_label = get_translated_string("category_label", user_lang, category=translated_category)
+                subcategory_label = get_translated_string("subcategory_label", user_lang, subcategory=translated_subcat)
+                confirm_text = get_translated_string("confirm_categorization", user_lang)
+                
                 # Confirmation message
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Confirm", callback_data=f"savecat|{product_id}|{category}|{subcategory}")],
@@ -446,9 +663,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 ])
                 
                 await query.edit_message_text(
-                    f"📂 Category: {get_category_display_name(category)}\n"
-                    f"📁 Subcategory: {subcategory.title()}\n\n"
-                    f"Confirm categorization?",
+                    f"{category_label}\n"
+                    f"{subcategory_label}\n\n"
+                    f"{confirm_text}",
                     reply_markup=keyboard
                 )
             else:
@@ -461,15 +678,28 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 category = parts[2]
                 subcategory = parts[3] if len(parts) > 3 and parts[3] else None
                 
+                # Get user language preference
+                user_id = update.effective_user.id
+                user_lang = await db.get_user_language(user_id)
+                
                 # Save categorization
                 await db.update_product_category(product_id, category, subcategory)
                 
-                category_text = get_category_display_name(category)
+                # Translate category name
+                category_key = f"category_{category.lower()}"
+                translated_category = get_translated_string(category_key, user_lang)
+                if translated_category == category_key:
+                    translated_category = get_category_display_name(category)
+                
+                category_text = translated_category
                 if subcategory:
-                    category_text += f" • {subcategory.title()}"
+                    translated_subcat = get_subcategory_display_name(subcategory, user_lang)
+                    category_text += f" • {translated_subcat}"
+                
+                success_msg = get_translated_string("product_categorized_successfully", user_lang, product_id=product_id)
                 
                 await query.edit_message_text(
-                    f"✅ Product #{product_id} categorized successfully!\n\n"
+                    f"{success_msg}\n\n"
                     f"📂 {category_text}"
                 )
                 logger.info(f"Product {product_id} categorized as {category}/{subcategory} by admin {update.effective_user.id}")
@@ -890,6 +1120,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_last_message[user_id] = current_time
     
+    # Check if admin is in broadcast workflow
+    if is_admin(user_id) and 'broadcast_mode' in context.user_data:
+        from handlers.admin import handle_broadcast_workflow
+        await handle_broadcast_workflow(update, context)
+        return
+    
     # Handle as search query
     if update.message and update.message.text:
         await handle_search(update, context)
@@ -935,8 +1171,49 @@ async def post_init(application: Application):
     await db.init_db()
     logger.info("Database initialized")
     
+    # Set bot commands for the command menu
+    await setup_bot_commands(application.bot)
+    
     # Start cleanup task
     asyncio.create_task(cleanup_task(application))
+
+
+async def setup_bot_commands(bot):
+    """Set up bot commands that appear in the Telegram command menu."""
+    # Define user commands (available to all users)
+    # Removed: language, subscribe, unsubscribe per requirements
+    user_commands = [
+        BotCommand("start", "Start the bot and select language"),
+        BotCommand("menu", "Browse the product catalog"),
+    ]
+    
+    # Define admin commands (available to admins only)
+    # Removed: block, unblock per requirements
+    admin_commands = user_commands + [
+        BotCommand("stats", "View catalog statistics"),
+        BotCommand("users", "View and manage bot users"),
+        BotCommand("recategorize", "Categorize uncategorized products"),
+        BotCommand("nuke", "Delete all products (use with caution)"),
+        BotCommand("send", "Send a message to a specific user"),
+        BotCommand("broadcast", "Send a message to all users"),
+    ]
+    
+    # Set default commands for all users
+    await bot.set_my_commands(user_commands)
+    
+    # Set admin commands for each admin
+    admin_ids = get_admin_ids()
+    for admin_id in admin_ids:
+        try:
+            await bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=admin_id)
+            )
+            logger.info(f"Set admin commands for user {admin_id}")
+        except Exception as e:
+            logger.warning(f"Could not set admin commands for {admin_id}: {e}")
+    
+    logger.info("Bot commands configured successfully")
 
 
 def main():
@@ -964,6 +1241,7 @@ def main():
     # Register handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
+    application.add_handler(CommandHandler("language", language_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("nuke", nuke_command))
     application.add_handler(CommandHandler("recategorize", recategorize_command))

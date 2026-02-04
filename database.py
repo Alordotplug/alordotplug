@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 import logging
 
-from config import Config
+from configs.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,8 @@ class Database:
                     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     interaction_count INTEGER DEFAULT 1,
                     notifications_enabled INTEGER DEFAULT 1,
-                    is_blocked INTEGER DEFAULT 0
+                    is_blocked INTEGER DEFAULT 0,
+                    language TEXT DEFAULT 'en'
                 )
             """)
             
@@ -150,6 +151,36 @@ class Database:
                 await db.execute("ALTER TABLE bot_users ADD COLUMN is_blocked INTEGER DEFAULT 0")
             except:
                 pass
+            
+            try:
+                await db.execute("ALTER TABLE bot_users ADD COLUMN language TEXT DEFAULT 'en'")
+            except:
+                pass
+            
+            # Create performance-critical indexes
+            logger.info("Creating database indexes...")
+            
+            # Products table indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_category_subcategory ON products(category, subcategory)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_created_at ON products(created_at DESC)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_products_media_group_id ON products(media_group_id)")
+            
+            # Bot users indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_bot_users_notifications ON bot_users(notifications_enabled) WHERE notifications_enabled = 1")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_bot_users_last_seen ON bot_users(last_seen DESC)")
+            
+            # Notification queue indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_notification_queue_user_sent ON notification_queue(user_id, sent_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_notification_queue_created ON notification_queue(created_at)")
+            
+            # Pagination state indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_pagination_state_user ON pagination_state(user_id, created_at DESC)")
+            
+            # Custom message queue indexes
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_custom_message_queue_user_sent ON custom_message_queue(user_id, sent_at)")
+            
+            logger.info("Database indexes created successfully")
             
             await db.commit()
             logger.info("Database initialized successfully")
@@ -489,6 +520,18 @@ class Database:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
     
+    async def get_all_category_counts(self) -> Dict[str, int]:
+        """Get product counts for all categories in a single query (optimized)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT category, COUNT(*) as count 
+                FROM products 
+                WHERE category IS NOT NULL 
+                GROUP BY category
+            """) as cursor:
+                rows = await cursor.fetchall()
+                return {row[0]: row[1] for row in rows}
+    
     async def get_all_categories(self) -> List[str]:
         """Get list of all unique categories."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -611,12 +654,45 @@ class Database:
                 rows = await cursor.fetchall()
                 return [dict(row) for row in rows]
     
+    async def get_users_paginated(self, limit: int = 10, offset: int = 0) -> tuple[int, List[Dict[str, Any]]]:
+        """
+        Get paginated list of bot users with total count.
+        
+        Args:
+            limit: Number of users per page
+            offset: Number of users to skip
+        
+        Returns:
+            Tuple of (total_count, users_list)
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get total count
+            async with db.execute("SELECT COUNT(*) FROM bot_users") as cursor:
+                total = (await cursor.fetchone())[0]
+            
+            # Get paginated results
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM bot_users ORDER BY last_seen DESC LIMIT ? OFFSET ?
+            """, (limit, offset)) as cursor:
+                rows = await cursor.fetchall()
+                return total, [dict(row) for row in rows]
+    
     async def count_users(self) -> int:
         """Get total number of users."""
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT COUNT(*) FROM bot_users") as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
+    
+    async def user_exists(self, user_id: int) -> bool:
+        """Check if a user exists in the database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT user_id FROM bot_users WHERE user_id = ?
+            """, (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row is not None
     
     async def set_user_notifications(self, user_id: int, enabled: bool):
         """Enable or disable notifications for a user."""
@@ -755,6 +831,36 @@ class Database:
             """, (user_id, minutes)) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
+    
+    async def get_user_language(self, user_id: int) -> str:
+        """Get user's preferred language."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT language FROM bot_users WHERE user_id = ?
+            """, (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 'en'
+    
+    async def set_user_language(self, user_id: int, language: str):
+        """Set user's preferred language."""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check if user exists
+            async with db.execute("SELECT user_id FROM bot_users WHERE user_id = ?", (user_id,)) as cursor:
+                exists = await cursor.fetchone()
+            
+            if exists:
+                # User exists, update only language and last_seen
+                await db.execute("""
+                    UPDATE bot_users SET language = ?, last_seen = ? WHERE user_id = ?
+                """, (language, datetime.now(), user_id))
+            else:
+                # New user, insert with all fields
+                await db.execute("""
+                    INSERT INTO bot_users (user_id, language, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?)
+                """, (user_id, language, datetime.now(), datetime.now()))
+            
+            await db.commit()
 
     
 

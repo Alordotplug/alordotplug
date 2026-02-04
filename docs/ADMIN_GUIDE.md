@@ -3,6 +3,16 @@
 ## Overview
 This guide explains how to use the admin features of the bot.
 
+## Accessing Admin Commands
+
+Admin commands are automatically displayed in your Telegram command menu. The bot sets up personalized command lists:
+- **User commands** - Visible to all users (start, menu)
+- **Admin commands** - Additional commands visible only to admins
+
+The command menu appears below the text input bar. Tap the menu icon (☰) or type `/` to see available commands.
+
+**Note:** Some commands like `/language`, `/subscribe`, `/unsubscribe`, `/block`, and `/unblock` are not shown in the command menu but are still available by typing them directly.
+
 ## Admin Commands
 
 ### `/start`
@@ -27,14 +37,6 @@ View and manage bot users (admin only)
 - Navigate pages with ⬅️ Previous / ➡️ Next buttons
 - Useful for monitoring bot engagement and controlling who gets notifications
 
-### `/add_product`
-Manually add a product to the catalog (admin only)
-- **Usage**: Send media (photo/video/document) with caption `/add_product <CATEGORY> <description>`
-- **Example**: Send a photo with caption `/add_product CARTRIDGES Premium Blue Dream Cart`
-- Bot will prompt for subcategory if applicable
-- Product is immediately added and **all subscribed users are notified**
-- Categories: CARTRIDGES, EDIBLES, CONCENTRATES, PREROLLS, SHROOMS, FLOWER, DATEDPROOFS, CLIENTTOUCHDOWNS
-
 ### `/nuke`
 Delete ALL products from catalog (admin only)
 - **Double confirmation required!**
@@ -49,9 +51,49 @@ Send categorization notifications for uncategorized products (admin only)
 - Sends up to 10 categorization requests
 - Run multiple times to process all uncategorized products
 
+### `/send`
+Send a message to a specific user (admin only) - **Interactive Workflow**
+
+**New 3-Step Process:**
+1. **Start Command**: Type `/send`
+2. **Enter User ID**: Bot asks for user ID, you reply with the ID
+3. **Enter Message**: Bot asks for message, you type your message
+4. **Confirm & Send**: Bot shows confirmation with buttons - click "Confirm & Send" to complete
+
+**Features:**
+- Validates user exists and is not blocked
+- Shows clear confirmation before sending
+- Can cancel at any step
+- Rate limited to prevent spam
+
+### `/broadcast`
+Send a message to all users (admin only) - **Interactive Workflow**
+
+**New 2-Step Process:**
+1. **Start Command**: Type `/broadcast`
+2. **Enter Message**: Bot asks for message, you type your broadcast
+3. **Confirm & Send**: Bot shows confirmation with user count - click "Confirm & Broadcast" to complete
+
+**Features:**
+- Shows how many users will receive the message
+- Automatically excludes blocked users and admins
+- Rate limiting applies per user
+- Can cancel before sending
+- Messages are queued and delivered with delays
+
+### `/block` and `/unblock`
+Block/unblock users from using the bot (admin only)
+
+**Note:** These commands are not shown in the command menu but are still available.
+
+**Usage:**
+- `/block <user_id>` - Block a user (e.g., `/block 123456789`)
+- `/unblock <user_id>` - Unblock a user (e.g., `/unblock 123456789`)
+- Use `/users` to find user IDs
+
 ## New Product Workflows
 
-### Workflow 1: Automatic from Channel
+### Automatic Product Detection from Channel
 
 When a new product is posted to the monitored channel:
 
@@ -79,30 +121,6 @@ When a new product is posted to the monitored channel:
    - Confirmation message shown
    - Product now appears in category filter
    - **All subscribed users are notified automatically**
-
-### Workflow 2: Manual Addition by Admin
-
-Using the `/add_product` command:
-
-1. **Admin sends media with command**
-   - Photo, video, or document with caption
-   - Caption format: `/add_product <CATEGORY> <description>`
-   - Example: `/add_product FLOWER Premium Blue Dream`
-
-2. **Bot validates and prompts**
-   - Checks if category is valid
-   - If category has subcategories, shows selection menu
-   - Admin selects subcategory or "No Subcategory"
-
-3. **Product is added immediately**
-   - Product saved with category/subcategory
-   - Assigned unique product ID
-   - Confirmation shown to admin
-
-4. **Users are notified**
-   - **All subscribed users receive notification**
-   - Notification includes category and description
-   - Users can view product immediately
 
 ## User Notification Management
 

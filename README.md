@@ -1,371 +1,371 @@
 # Telegram Media Catalog Bot
 
-A complete, production-ready Telegram bot that acts as a media product catalog. The bot automatically monitors a public channel for media posts, saves them as products, and allows users to browse and search the catalog.
+A production-ready Telegram bot for managing and browsing a media product catalog. The bot automatically monitors a Telegram channel for new products and provides users with an intuitive interface for browsing, searching, and receiving notifications.
 
-📋 **[See recent changes in CHANGELOG.md](CHANGELOG.md)**
+## 📚 Documentation
 
-## Features
+- **[User Guide](docs/USER_GUIDE.md)** - Complete guide for bot users
+- **[Admin Guide](docs/ADMIN_GUIDE.md)** - Admin features and workflows
+- **[Environment Configuration](configs/.env.example)** - All configuration options explained
 
-- ✅ **Automatic Product Detection**: Monitors a public channel and automatically saves media posts as products
-- ✅ **Full Catalog Browsing**: View all products with pagination and category filtering
-- ✅ **Fuzzy Search**: Natural language search with typo tolerance
-- ✅ **Product Viewing**: View individual products with original media and captions
-- ✅ **Category & Subcategory Support**: Organized browsing with hierarchical categories
-- ✅ **Product Notifications**: Notify subscribed users about new products with anti-spam rate limiting
-  - Note: DATEDPROOFS and CLIENTTOUCHDOWNS categories are excluded from notifications
-  - Note: ANNOUNCEMENTS category WILL trigger notifications but is hidden from "All Products" view
-- ✅ **Manual Product Addition**: Admins can manually add products with `/add_product` and notify subscribed users
-- ✅ **User Management**: Admins can control notification preferences and block users
-- ✅ **Custom Messaging**: Admins can send direct messages or broadcast to all users
-- ✅ **User Blocking**: Admins can block/unblock users from using the bot
-- ✅ **Admin Features**: Delete products, view statistics, manage categorization
-- ✅ **Rate Limiting**: Prevents spam and abuse
-- ✅ **Pagination**: Smart pagination for catalog and search results
-- ✅ **Error Handling**: Robust error handling and logging
+## ✨ Features
 
-## Requirements
+### For Users
+- 🌐 **Multi-Language Support** - 7 languages with automatic translation (English UK, English USA, German, Dutch, Italian, Spanish, French)
+- 🔍 **Fuzzy Search** - Natural language search with typo tolerance
+- 📂 **Category Browsing** - Organized product categories with subcategories
+- 🔔 **Smart Notifications** - Opt-in notifications for new products with rate limiting
+- 📱 **Interactive Interface** - Button-based navigation, no typing required
+- 🎯 **Language Selection at Start** - New users choose their language immediately
+- 🌍 **Easy Language Switching** - Change language anytime from start page or /language command
+- 📄 **Pagination** - Smooth navigation through large catalogs
+- 📋 **Command Menu** - All available commands displayed below input bar
 
-- Python 3.8+
-- Telegram Bot Token (from [@BotFather](https://t.me/botfather))
-- A public Telegram channel where the bot is an admin with "Can post messages" rights
+### For Admins
+- 🤖 **Automatic Product Detection** - Monitors channel and captures new media automatically
+- 🏷️ **Category Management** - Interactive categorization with subcategory support
+- 👥 **User Management** - View users, manage notifications, block/unblock
+- 📊 **Statistics** - Product counts, user engagement metrics
+- 💬 **Custom Messaging** - Send messages to specific users or broadcast to all
+- 🔄 **Recategorization** - Find and categorize uncategorized products
+- 🗑️ **Product Management** - Delete individual products or bulk delete (with confirmation)
 
-## Installation
+### Technical Features
+- ⚡ **Async/Await Architecture** - High performance with asyncio and aiosqlite
+- 🔒 **Environment-based Configuration** - All settings via environment variables
+- 🌐 **Webhook Support** - Production-ready for Render.com and other platforms
+- 📦 **SQLite Database** - Lightweight, no external database required
+- 🛡️ **Rate Limiting** - Anti-spam protection for notifications
+- 🔄 **Automatic Migration** - Database schema updates on startup
+- 📝 **Comprehensive Logging** - Structured logs for monitoring
 
-### 1. Clone or Download the Project
+## 🚀 Quick Start
 
-```bash
-cd media-catalog-bot
-```
+### Prerequisites
+- Python 3.8 or higher
+- Telegram Bot Token from [@BotFather](https://t.me/botfather)
+- A Telegram channel (bot must be admin with "Post messages" permission)
+- Your Telegram user ID (get from [@userinfobot](https://t.me/userinfobot))
 
-### 2. Install Dependencies
+### Installation
 
-```bash
-pip install -r requirements.txt
-```
+1. **Clone the repository**
+   ```bash
+   git clone <repository-url>
+   cd tombrady420
+   ```
 
-### 3. Configure Environment Variables
+2. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-The bot uses `python-decouple` for secure configuration management. **Never hardcode sensitive data like bot tokens in your source code.**
+3. **Configure environment variables**
+   ```bash
+   cp configs/.env.example .env
+   ```
+   
+   Edit `.env` with your values:
+   ```env
+   BOT_TOKEN=your_bot_token_from_botfather
+   CHANNEL_ID=-1001234567890
+   ADMIN_IDS=123456789,987654321
+   ORDER_CONTACT=@yourusername
+   ```
+   
+   See [configs/.env.example](configs/.env.example) for all available options.
 
-Copy `.env.example` to `.env` and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your actual values:
-
-```env
-BOT_TOKEN=your_bot_token_here
-CHANNEL_ID=-1001234567890
-ADMIN_IDS=123456789,987654321
-```
-
-**How to get these values:**
-
-- **BOT_TOKEN**: 
-  1. Open Telegram and message [@BotFather](https://t.me/botfather)
-  2. Send `/newbot` command and follow the instructions
-  3. Copy the bot token provided (format: `1234567890:ABCdefGHIjklMNOpqrsTUVwxyz`)
-  4. ⚠️ **Keep this token secret!** Anyone with this token can control your bot
-
-- **CHANNEL_ID**: 
-  1. Forward any message from your channel to [@userinfobot](https://t.me/userinfobot)
-  2. The bot will show the channel ID (must be a negative number, e.g., `-1001234567890`)
-  3. Alternatively, use [@getidsbot](https://t.me/getidsbot)
-  
-- **ADMIN_IDS**: 
-  1. Message [@userinfobot](https://t.me/userinfobot) to get your Telegram user ID
-  2. Add multiple admin IDs separated by commas with no spaces (e.g., `123456789,987654321`)
-  3. These users will have admin privileges in the bot
-
-**Security Note:** The `.env` file is already in `.gitignore` and will not be committed to Git. Never share your `.env` file or commit it to version control.
-
-### 4. Set Up the Bot in Your Channel
-
-1. Add the bot to your public channel as an **Administrator**
-2. Grant the bot these permissions:
-   - ✅ Can post messages
-3. Make sure the channel is public or the bot has access
-
-## Usage
-
-### Running the Bot
-
-```bash
-python main.py
-```
+4. **Run the bot**
+   ```bash
+   python main.py
+   ```
 
 The bot will:
-- Initialize the database
-- Start monitoring the channel
-- Begin accepting user commands
+- Initialize the database automatically
+- Validate your configuration
+- Start listening for commands and channel posts
 
-### User Commands
+## 🌐 Deployment on Render.com
 
-- `/start` - Welcome message and catalog button
-- `/menu` - View full catalog with pagination
-- `/subscribe` - Enable product notifications
-- `/unsubscribe` - Disable product notifications
-- Natural language search - Just type keywords like "blue tshirt", "red shoes", etc.
+Perfect for free hosting with persistent storage:
 
-### Admin Commands
+1. **Fork this repository** to your GitHub account
 
-- `/add_product` - Manually add a product with category (send as caption to media)
-- `/users` - View and manage users (notifications, blocking)
+2. **Create a new Web Service** on [Render.com](https://render.com)
+   - Connect your GitHub repository
+   - Select "Python" environment
+   - Build command: `pip install -r requirements.txt`
+   - Start command: `python webhook_server.py`
+
+3. **Set environment variables** in Render dashboard:
+   ```
+   BOT_TOKEN=your_bot_token
+   CHANNEL_ID=-1001234567890
+   ADMIN_IDS=123456789,987654321
+   USE_WEBHOOK=true
+   WEBHOOK_URL=https://your-app-name.onrender.com
+   ORDER_CONTACT=@yourusername
+   ```
+
+4. **Optional: Add persistent disk** for database
+   - Create a disk in Render dashboard
+   - Mount to `/opt/render/project/data`
+   - Set `DB_PATH=/opt/render/project/data/catalog.db`
+
+See [configs/.env.example](configs/.env.example) for complete Render.com deployment notes.
+
+## 📖 User Commands
+
+The most commonly used commands are displayed in the Telegram command menu below the input bar for easy access:
+
+- `/start` - Welcome message and language selection (for new users)
+- `/menu` - Browse the full product catalog
+
+Additional commands (not shown in menu but still available):
+- `/language` - Change your preferred language  
+- `/subscribe` - Enable notifications for new products
+- `/unsubscribe` - Disable notifications
+- **Search** - Just type keywords to search (e.g., "blue cart", "edibles")
+
+See the [User Guide](docs/USER_GUIDE.md) for detailed instructions.
+
+## 🔧 Admin Commands
+
+Admin commands appear in the command menu for users with admin permissions:
+
+- `/stats` - View catalog and user statistics
+- `/users` - View and manage bot users
+- `/recategorize` - Send categorization prompts for uncategorized products
+- `/nuke` - Delete all products (double confirmation required)
+- `/send` - Broadcast a message to a specific user (interactive workflow)
+- `/broadcast` - Send a message to all users (interactive workflow)
+
+Additional admin commands (not shown in menu but still available):
 - `/block <user_id>` - Block a user from using the bot
 - `/unblock <user_id>` - Unblock a user
-- `/send <user_id> <message>` - Send a custom message to a specific user
-- `/broadcast <message>` - Send a message to all users
-- `/stats` - View catalog statistics (total products, added today)
-- `/recategorize` - Send categorization prompts for uncategorized products
-- `/nuke` - Delete all products (with double confirmation)
 
-For detailed admin instructions, see [ADMIN_GUIDE.md](ADMIN_GUIDE.md).
+See the [Admin Guide](docs/ADMIN_GUIDE.md) for detailed workflows.
 
-### How It Works
+## 📦 Product Categories
 
-1. **Product Creation**: When you (or anyone) posts a message with media in the monitored channel, the bot automatically:
-   - Detects the media (photo, video, document, animation)
-   - Saves the file_id, caption, and metadata to the database
-   - Stores the message_id and chat_id for later deletion
+Products are organized into categories for easy browsing:
 
-2. **User Interaction**: Users interact with the bot privately:
-   - Browse the catalog with pagination
-   - Search products using natural language
-   - View individual products with original media
+- 🛒 **Cartridges** - Vape cartridges with subcategories (Authentics, Replicas)
+- 🍫 **Edibles** - Consumable products (Flower Edibles, Shroom Edibles)
+- 💎 **Concentrates** - Various extract types (Snowcaps, Moonrocks, Hash, Badder, Shatter, etc.)
+- 🚬 **Pre-Rolls** - Ready-to-smoke products (Flower Prerolls, Infused Prerolls)
+- 🍄 **Shrooms** - Mushroom products
+- 🌸 **Flower** - Cannabis flower with quality tiers
+- 📅 **Dated Proofs** - Verification photos (no notifications)
+- ✈️ **Client Touchdowns** - Delivery confirmations (no notifications)
+- 📢 **Announcements** - Important updates (triggers notifications)
 
-3. **Admin Actions**: Admins can:
-   - Delete products from catalog (channel messages remain intact for manual cleanup)
-   - View statistics
+## 🔄 How It Works
 
-## Deployment
+### For Users
 
-### Render.com (Webhook Mode - Recommended for Production)
+1. Send `/start` to the bot
+2. Select your preferred language (first time only)
+3. Browse categories or search for products
+4. View products with full media and details
+5. Optional: Subscribe to notifications for new products
 
-The bot now supports webhook mode for better performance on serverless platforms like Render.com.
+### For Admins
 
-1. Create a new Web Service on [Render.com](https://render.com)
-2. Connect your GitHub repository
-3. Configure the service:
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn webhook_server:app --host 0.0.0.0 --port $PORT`
-4. Add environment variables:
-   - `BOT_TOKEN` - Your bot token
-   - `CHANNEL_ID` - Your channel ID
-   - `ADMIN_IDS` - Admin user IDs (comma-separated)
-   - `USE_WEBHOOK=true` - Enable webhook mode
-   - `WEBHOOK_URL` - Your Render app URL (e.g., https://your-app.onrender.com)
-5. Deploy!
+1. Post media to your monitored channel
+2. Bot automatically detects and saves the product
+3. You receive a categorization prompt
+4. Select the appropriate category and subcategory
+5. Bot notifies all subscribed users automatically
 
-For detailed webhook deployment instructions, see [WEBHOOK_DEPLOYMENT.md](WEBHOOK_DEPLOYMENT.md).
+### Product Detection
 
-### PythonAnywhere
+When media is posted to the monitored channel:
+- Bot captures photos, videos, documents, and animations
+- Supports media albums (multiple photos/videos in one post)
+- Extracts captions and stores all metadata
+- Waits for admin to categorize via interactive buttons
+- Sends notifications to users once categorized
 
-1. Upload all files to your PythonAnywhere account
-2. Install dependencies in a Bash console:
-   ```bash
-   pip3.10 install --user -r requirements.txt
-   ```
-3. Create a `.env` file with your configuration
-4. Create a scheduled task (Tasks tab) to run:
-   ```bash
-   python3.10 main.py
-   ```
-   Or use a "Always-on task" for continuous running
+## 🗄️ Database
 
-### Railway
+The bot uses SQLite with automatic schema management:
 
-1. Create a new project on [Railway](https://railway.app)
-2. Connect your GitHub repository or upload files
-3. Add environment variables in Railway dashboard
-4. Railway will automatically detect Python and install dependencies
-5. The bot will start automatically
+- **Automatic initialization** - Creates tables on first run
+- **Auto-migration** - Adds new columns to existing databases
+- **No manual setup** - Everything handled automatically
+- **Persistent storage** - Use Render.com persistent disks for production
 
-### VPS (Ubuntu/Debian)
+Tables: products, bot_users, pagination_state, media_groups, pending_categorization, notification_queue, and more.
 
-1. SSH into your VPS
-2. Install Python and pip:
-   ```bash
-   sudo apt update
-   sudo apt install python3 python3-pip
-   ```
-3. Clone/upload the project
-4. Install dependencies:
-   ```bash
-   pip3 install -r requirements.txt
-   ```
-5. Create `.env` file
-6. Run with screen or systemd:
+## 🌐 Language Support
 
-   **Using screen:**
-   ```bash
-   screen -S bot
-   python3 main.py
-   # Press Ctrl+A then D to detach
-   ```
+### Supported Languages
 
-   **Using systemd (recommended):**
-   
-   Create `/etc/systemd/system/telegram-bot.service`:
-   ```ini
-   [Unit]
-   Description=Telegram Media Catalog Bot
-   After=network.target
+- 🇬🇧 English (UK) (default)
+- 🇺🇸 English (USA)
+- 🇩🇪 German  
+- 🇳🇱 Dutch
+- 🇮🇹 Italian
+- 🇪🇸 Spanish
+- 🇫🇷 French
 
-   [Service]
-   Type=simple
-   User=your_username
-   WorkingDirectory=/path/to/media-catalog-bot
-   ExecStart=/usr/bin/python3 main.py
-   Restart=always
-   RestartSec=10
+### How Translation Works
 
-   [Install]
-   WantedBy=multi-user.target
-   ```
-   
-   Then:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable telegram-bot
-   sudo systemctl start telegram-bot
-   sudo systemctl status telegram-bot
-   ```
+1. All base strings are in English
+2. New users select preferred language via interactive language menu at `/start`
+3. Existing users can change language via "Change Language" button on start page or `/language` command
+4. Bot automatically translates:
+   - All messages and instructions
+   - Button texts and navigation labels
+   - Category and subcategory names
+   - Command descriptions
+5. Translations are cached for performance
+6. Each user sees the interface in their chosen language
+7. Product captions and all user-facing text are translated
+8. **Important**: Button callbacks use internal category codes, so correct commands are sent regardless of the displayed translation
 
-### Docker
+## 🔔 Notification System
 
-Create `Dockerfile`:
+- Opt-in via `/subscribe` command
+- Rate limited to 5 per hour per user
+- Automatic delivery when products are categorized
+- Respects user's language preference
+- Excluded categories: Dated Proofs, Client Touchdowns
 
-```dockerfile
-FROM python:3.11-slim
+## 🔐 Security & Privacy
 
-WORKDIR /app
+### Environment Variables
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+All sensitive configuration managed through environment variables:
+- Bot token never hardcoded
+- Admin IDs configurable
+- No credentials in source code
+- Safe for public repositories
 
-COPY . .
+See [configs/.env.example](configs/.env.example) for all options.
 
-CMD ["python", "main.py"]
-```
+### User Privacy
 
-Create `docker-compose.yml`:
+**Data collected:**
+- Telegram user ID, username, first/last name
+- Language and notification preferences
+- Interaction statistics
 
-```yaml
-version: '3.8'
+**Data NOT collected:**
+- Message content (except search queries)
+- Personal information beyond Telegram profile
+- Payment or location data
 
-services:
-  bot:
-    build: .
-    restart: unless-stopped
-    env_file:
-      - .env
-    volumes:
-      - ./catalog.db:/app/catalog.db
-```
+## 🛠️ Development
 
-Run:
-```bash
-docker-compose up -d
-```
-
-## Project Structure
+### Project Structure
 
 ```
 tombrady420/
-├── main.py                     # Main entry point
-├── config.py                   # Configuration management
-├── database.py                 # Database models and operations
-├── webhook_server.py           # Webhook server for production
-├── scan_channel.py             # Channel scanning utility
-├── handlers/                   # Command and message handlers
-│   ├── start.py               # /start command
-│   ├── menu.py                # /menu and catalog browsing
-│   ├── search.py              # Search functionality
-│   ├── product_view.py        # Product viewing
-│   └── admin.py               # Admin commands
-├── utils/                      # Utility functions
-│   ├── notifications.py       # Notification system
-│   ├── pagination.py          # Pagination logic
-│   ├── fuzzy_search.py        # Fuzzy search implementation
-│   ├── categories.py          # Category definitions
-│   └── helpers.py             # Helper functions
-├── tests/                      # Test files
-├── requirements.txt            # Python dependencies
-├── .env.example               # Environment variables template
-├── README.md                  # Main documentation
-├── CHANGELOG.md               # Version history and changes
-├── ADMIN_GUIDE.md             # Admin instructions
-├── DATABASE_PERSISTENCE.md    # Database setup guide
-└── WEBHOOK_DEPLOYMENT.md      # Webhook deployment guide
+├── main.py                 # Main bot entry point (polling mode)
+├── webhook_server.py       # Webhook server for production
+├── database.py             # Database models and operations
+├── requirements.txt        # Python dependencies
+├── configs/
+│   ├── config.py          # Configuration management
+│   └── .env.example       # Environment variables template
+├── handlers/
+│   ├── start.py           # /start command with language selection
+│   ├── language.py        # /language command
+│   ├── menu.py            # Catalog browsing
+│   ├── search.py          # Search functionality
+│   ├── product_view.py    # Product display
+│   └── admin.py           # Admin commands
+├── utils/
+│   ├── helpers.py         # Utility functions
+│   ├── categories.py      # Category management
+│   ├── pagination.py      # Pagination logic
+│   ├── fuzzy_search.py    # Search implementation
+│   └── notifications.py   # Notification service
+├── translations/
+│   ├── language_config.py # Supported languages
+│   ├── translator.py      # Translation service
+│   └── strings.py         # Translatable strings
+└── docs/
+    ├── USER_GUIDE.md      # Complete user documentation
+    └── ADMIN_GUIDE.md     # Admin documentation
 ```
 
-## Documentation
+### Running Tests
 
-- **[README.md](README.md)** - Main documentation (this file)
-- **[CHANGELOG.md](CHANGELOG.md)** - Version history and recent changes
-- **[ADMIN_GUIDE.md](ADMIN_GUIDE.md)** - Detailed admin instructions
-- **[DATABASE_PERSISTENCE.md](DATABASE_PERSISTENCE.md)** - Database setup and migration
-- **[WEBHOOK_DEPLOYMENT.md](WEBHOOK_DEPLOYMENT.md)** - Production deployment guide
+```bash
+python test_language_migration.py
+python test_start_command_integration.py
+```
 
-## Database
+### Local Development
 
-The bot uses SQLite by default (stored as `catalog.db`). The database contains:
+```bash
+pip install -r requirements.txt
+cp configs/.env.example .env
+# Edit .env with your values
+python main.py
+```
 
-- **products**: All saved products with file_id, caption, message metadata
-- **pagination_state**: User pagination states (auto-cleaned after 10 minutes)
-- **ignored_messages**: Messages that should be skipped during scanning
-- **media_groups**: Tracks media groups (photo albums)
-- **pending_categorization**: Products awaiting admin categorization
-- **bot_users**: Tracks users who interact with the bot
+## 📝 Environment Variables Reference
 
-### Database Persistence
+All configuration via environment variables - see [configs/.env.example](configs/.env.example):
 
-⚠️ **Important**: By default, the database is stored locally and may be lost on redeploys.
+**Required:**
+- `BOT_TOKEN` - Telegram bot token
+- `CHANNEL_ID` - Channel where products are posted
+- `ADMIN_IDS` - Comma-separated admin user IDs
 
-For production deployments, you should:
-1. **Use persistent disk storage** (Render, Docker volumes)
-2. **Use PostgreSQL** for better scalability
-3. **Set up regular backups**
+**Optional:**
+- `CHANNEL_USERNAME` - Alternative to CHANNEL_ID
+- `DB_PATH` - Database file path (default: catalog.db)
+- `USE_WEBHOOK` - Enable webhook mode (default: false)
+- `WEBHOOK_URL` - Webhook URL for production
+- `ORDER_CONTACT` - Contact info for orders (default: @FLYAWAYPEP)
 
-📚 See [DATABASE_PERSISTENCE.md](DATABASE_PERSISTENCE.md) for detailed instructions on:
-- Setting up persistent storage for different platforms
-- Importing existing channel messages after database loss
-- Migration from SQLite to PostgreSQL
-- Backup strategies
+## 🐛 Troubleshooting
 
-To use PostgreSQL instead, modify `database.py` to use `asyncpg` or `psycopg2`.
+**Bot doesn't start:**
+- Check `.env` file has required variables
+- Verify BOT_TOKEN is correct
+- Check logs for error messages
 
-## Troubleshooting
+**Products not detected:**
+- Verify bot is admin in channel
+- Check CHANNEL_ID matches
+- Review logs for errors
 
-### Bot doesn't detect channel posts
+**Notifications not working:**
+- Users must subscribe with `/subscribe`
+- Check rate limits (5 per hour)
+- Ensure users haven't blocked bot
 
-- Verify the bot is an admin in the channel
-- Check that `CHANNEL_ID` or `CHANNEL_USERNAME` is correct
-- Ensure the channel is public or the bot has access
-- Check bot logs for errors
+**Webhook issues (Render.com):**
+- Set `USE_WEBHOOK=true`
+- Set `WEBHOOK_URL=https://your-app.onrender.com`
+- Verify HTTPS (not HTTP)
 
-### Search not working
+## ⚡ Performance
 
-- Make sure `rapidfuzz` is installed: `pip install rapidfuzz`
-- The bot falls back to `difflib` if `rapidfuzz` is not available
+- Async architecture for concurrent users
+- Translation caching for speed  
+- Rate limiting prevents overload
+- Pagination for large catalogs
+- Efficient SQLite database
+- Minimal resource usage
 
-### Permission errors
+## 🎯 Use Cases
 
-- Ensure the bot has "Can post messages" rights
-- Check that the bot hasn't been removed from the channel
+Perfect for:
+- Product catalogs
+- Media galleries
+- Service listings
+- Portfolio showcases
+- Announcement channels
+- Document libraries
+- Any organized media collection
 
-### Database errors
+---
 
-- Check file permissions for `catalog.db`
-- Ensure the directory is writable
-
-## License
-
-This project is provided as-is for educational and commercial use.
-
-## Support
-
-For issues or questions, check the logs in the console output. The bot includes comprehensive error handling and logging.
-
+**Built with Python, python-telegram-bot, SQLite, and deep-translator**
