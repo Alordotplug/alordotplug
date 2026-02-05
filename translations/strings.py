@@ -2,14 +2,14 @@
 Translatable strings for the bot.
 All user-facing messages should be defined here.
 """
-from configs.config import Config
 
 # Base strings in English - these will be translated on the fly
 def get_strings():
-    """Get translatable strings with config values."""
+    """Get translatable strings."""
     return {
         # Start command
-        "welcome": f"👋 Welcome, {{name}}!\n\nI'm your media product catalog bot. I help you browse and search products from our catalog.\n\nUse /menu to view all products or simply type what you're looking for!  DM {Config.ORDER_CONTACT} TO ORDER",
+        "welcome_with_contact": "👋 Welcome, {name}!\n\nI'm your media product catalog bot. I help you browse and search products from our catalog.\n\nUse /menu to view all products or simply type what you're looking for!\n\n💬 DM {contact} TO ORDER",
+        "admin_commands_info": "👨‍💼 Admin Commands:\n• /start - Welcome message\n• /menu - View catalog\n• /users - Manage users\n• /send - Send message to user\n• /broadcast - Broadcast to all users\n• /setcontact - Set order contact\n• /recategorize - Recategorize products\n• /nuke - Delete all products",
         "notifications_enabled": "🔔 **Notifications Enabled!**\n\nYou will now receive notifications when new products are added to the catalog.\n\nUse /unsubscribe to stop receiving notifications.",
         "notifications_disabled": "🔕 **Notifications Disabled**\n\nYou will no longer receive notifications about new products.\n\nUse /subscribe to enable notifications again.",
         
@@ -87,10 +87,9 @@ def get_strings():
         # Product view
         "product_info": "📦 **Product Details**\n\n{category}\n🆔 ID: {id}",
         "uncategorized": "Uncategorized",
-        "order_contact_info": f"💬 DM {Config.ORDER_CONTACT} TO ORDER",
+        "dm_to_order": "👆 DM TO ORDER: {contact}",
         
         # Admin
-        "admin_stats": "📊 **Bot Statistics**\n\n{stats}",
         "product_deleted": "✅ Product deleted successfully.",
         "user_blocked": "🚫 User {user_id} has been blocked.",
         "user_unblocked": "✅ User {user_id} has been unblocked.",

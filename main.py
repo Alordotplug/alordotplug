@@ -25,19 +25,22 @@ from handlers.search import handle_search, show_search_results, handle_search_pa
 from handlers.product_view import show_product, handle_product_callback
 from handlers.language import language_command, handle_language_callback
 from handlers.admin import (
-    stats_command, delete_product, nuke_command, recategorize_command, 
+    delete_product, nuke_command, recategorize_command, 
     users_command, show_users_page,
-    block_command, unblock_command, send_command, broadcast_command
+    block_command, unblock_command, send_command, broadcast_command,
+    setcontact_command, handle_setcontact_input
 )
 from translations.language_config import is_valid_language, LANGUAGE_DISPLAY
-from translations.translator import get_translated_string
+from translations.translator import get_translated_string_async, translation_service
 from utils.helpers import (
     get_file_id_and_type,
     has_media,
     get_channel_id,
     get_channel_username,
     get_admin_ids,
-    is_admin
+    is_admin,
+    get_user_display_name,
+    escape_markdown_v1
 )
 from utils.categories import get_all_categories, get_category_display_name, get_subcategories, get_subcategory_display_name, CATEGORIES
 from utils.notifications import NotificationService
@@ -334,9 +337,9 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         keyboard = InlineKeyboardMarkup(keyboard_buttons)
         
         # Get translated message
-        message_text = get_translated_string("language_settings", current_lang)
+        message_text = await get_translated_string_async("language_settings", current_lang)
         current_lang_name = LANGUAGE_DISPLAY.get(current_lang, LANGUAGE_DISPLAY["en"])
-        current_lang_text = get_translated_string(
+        current_lang_text = await get_translated_string_async(
             "current_language", 
             current_lang,
             language=current_lang_name
@@ -382,16 +385,21 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 # Show welcome message in selected language
                 is_subscribed = await db.is_user_subscribed(user_id)
                 
-                welcome_text = get_translated_string("welcome", lang_code, name=update.effective_user.first_name)
-                view_catalog_text = get_translated_string("view_catalog", lang_code)
-                change_language_text = get_translated_string("change_language", lang_code)
+                # Get user display name and order contact
+                display_name = get_user_display_name(update.effective_user, escaped=True)
+                order_contact = await db.get_order_contact()
+                escaped_contact = escape_markdown_v1(order_contact)
+                
+                welcome_text = await get_translated_string_async("welcome_with_contact", lang_code, name=display_name, contact=escaped_contact)
+                view_catalog_text = await get_translated_string_async("view_catalog", lang_code)
+                change_language_text = await get_translated_string_async("change_language", lang_code)
                 keyboard_buttons = [
                     [InlineKeyboardButton(view_catalog_text, callback_data="categories")],
                     [InlineKeyboardButton(change_language_text, callback_data="open_language_settings")]
                 ]
                 
                 if not is_subscribed:
-                    resubscribe_text = get_translated_string("resubscribe_notifications", lang_code)
+                    resubscribe_text = await get_translated_string_async("resubscribe_notifications", lang_code)
                     keyboard_buttons.append(
                         [InlineKeyboardButton(resubscribe_text, callback_data="toggle_notifications")]
                     )
@@ -601,7 +609,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                         ])
                     
                     # Add "No Subcategory" option
-                    save_without_text = get_translated_string("save_without_subcategory", user_lang)
+                    save_without_text = await get_translated_string_async("save_without_subcategory", user_lang)
                     keyboard_buttons.append([
                         InlineKeyboardButton(save_without_text, callback_data=f"savecat|{product_id}|{category}|")
                     ])
@@ -610,12 +618,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     
                     # Translate category name
                     category_key = f"category_{category.lower()}"
-                    translated_category = get_translated_string(category_key, user_lang)
+                    translated_category = await get_translated_string_async(category_key, user_lang)
                     if translated_category == category_key:
                         translated_category = get_category_display_name(category)
                     
-                    category_label = get_translated_string("category_label", user_lang, category=translated_category)
-                    select_or_save = get_translated_string("select_subcategory_or_save", user_lang)
+                    category_label = await get_translated_string_async("category_label", user_lang, category=translated_category)
+                    select_or_save = await get_translated_string_async("select_subcategory_or_save", user_lang)
                     
                     await query.edit_message_text(
                         f"{category_label}\n\n"
@@ -646,15 +654,15 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 
                 # Translate category name
                 category_key = f"category_{category.lower()}"
-                translated_category = get_translated_string(category_key, user_lang)
+                translated_category = await get_translated_string_async(category_key, user_lang)
                 if translated_category == category_key:
                     translated_category = get_category_display_name(category)
                 
                 # Translate strings
                 translated_subcat = get_subcategory_display_name(subcategory, user_lang)
-                category_label = get_translated_string("category_label", user_lang, category=translated_category)
-                subcategory_label = get_translated_string("subcategory_label", user_lang, subcategory=translated_subcat)
-                confirm_text = get_translated_string("confirm_categorization", user_lang)
+                category_label = await get_translated_string_async("category_label", user_lang, category=translated_category)
+                subcategory_label = await get_translated_string_async("subcategory_label", user_lang, subcategory=translated_subcat)
+                confirm_text = await get_translated_string_async("confirm_categorization", user_lang)
                 
                 # Confirmation message
                 keyboard = InlineKeyboardMarkup([
@@ -687,7 +695,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 
                 # Translate category name
                 category_key = f"category_{category.lower()}"
-                translated_category = get_translated_string(category_key, user_lang)
+                translated_category = await get_translated_string_async(category_key, user_lang)
                 if translated_category == category_key:
                     translated_category = get_category_display_name(category)
                 
@@ -696,7 +704,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     translated_subcat = get_subcategory_display_name(subcategory, user_lang)
                     category_text += f" • {translated_subcat}"
                 
-                success_msg = get_translated_string("product_categorized_successfully", user_lang, product_id=product_id)
+                success_msg = await get_translated_string_async("product_categorized_successfully", user_lang, product_id=product_id)
                 
                 await query.edit_message_text(
                     f"{success_msg}\n\n"
@@ -1120,6 +1128,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user_last_message[user_id] = current_time
     
+    # Check if admin is setting contact
+    if is_admin(user_id) and context.user_data.get('awaiting_contact'):
+        await handle_setcontact_input(update, context)
+        return
+    
     # Check if admin is in broadcast workflow
     if is_admin(user_id) and 'broadcast_mode' in context.user_data:
         from handlers.admin import handle_broadcast_workflow
@@ -1171,6 +1184,10 @@ async def post_init(application: Application):
     await db.init_db()
     logger.info("Database initialized")
     
+    # Set up translation service with database
+    translation_service.set_database(db)
+    logger.info("Translation service configured with database caching")
+    
     # Set bot commands for the command menu
     await setup_bot_commands(application.bot)
     
@@ -1190,12 +1207,12 @@ async def setup_bot_commands(bot):
     # Define admin commands (available to admins only)
     # Removed: block, unblock per requirements
     admin_commands = user_commands + [
-        BotCommand("stats", "View catalog statistics"),
         BotCommand("users", "View and manage bot users"),
-        BotCommand("recategorize", "Categorize uncategorized products"),
-        BotCommand("nuke", "Delete all products (use with caution)"),
         BotCommand("send", "Send a message to a specific user"),
         BotCommand("broadcast", "Send a message to all users"),
+        BotCommand("setcontact", "Set order contact username"),
+        BotCommand("recategorize", "Categorize uncategorized products"),
+        BotCommand("nuke", "Delete all products (use with caution)"),
     ]
     
     # Set default commands for all users
@@ -1242,7 +1259,6 @@ def main():
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("language", language_command))
-    application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("nuke", nuke_command))
     application.add_handler(CommandHandler("recategorize", recategorize_command))
     application.add_handler(CommandHandler("users", users_command))
@@ -1252,6 +1268,7 @@ def main():
     application.add_handler(CommandHandler("unblock", unblock_command))
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("setcontact", setcontact_command))
     
     # Channel post handler (for monitoring channel)
     channel_id = get_channel_id()

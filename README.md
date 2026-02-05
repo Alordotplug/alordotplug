@@ -25,7 +25,6 @@ A production-ready Telegram bot for managing and browsing a media product catalo
 - 🤖 **Automatic Product Detection** - Monitors channel and captures new media automatically
 - 🏷️ **Category Management** - Interactive categorization with subcategory support
 - 👥 **User Management** - View users, manage notifications, block/unblock
-- 📊 **Statistics** - Product counts, user engagement metrics
 - 💬 **Custom Messaging** - Send messages to specific users or broadcast to all
 - 🔄 **Recategorization** - Find and categorize uncategorized products
 - 🗑️ **Product Management** - Delete individual products or bulk delete (with confirmation)
@@ -133,7 +132,6 @@ See the [User Guide](docs/USER_GUIDE.md) for detailed instructions.
 
 Admin commands appear in the command menu for users with admin permissions:
 
-- `/stats` - View catalog and user statistics
 - `/users` - View and manage bot users
 - `/recategorize` - Send categorization prompts for uncategorized products
 - `/nuke` - Delete all products (double confirmation required)
@@ -224,6 +222,15 @@ Tables: products, bot_users, pagination_state, media_groups, pending_categorizat
 6. Each user sees the interface in their chosen language
 7. Product captions and all user-facing text are translated
 8. **Important**: Button callbacks use internal category codes, so correct commands are sent regardless of the displayed translation
+
+### Translation System Details
+
+The bot uses a smart translation system that:
+- **Preserves user names**: User names always appear in their original form, never translated
+- **Preserves contact information**: Order contact usernames (e.g., @FLYAWAYPEP) remain unchanged
+- **Template-based translation**: Translates message templates first, then inserts user data
+- **Example**: "Welcome, {name}!" → Translates to "Bienvenido, {name}!" → Displays as "Bienvenido, Hans!" (name preserved)
+- This ensures user names appear exactly as they do in Telegram profiles, preventing confusion
 
 ## 🔔 Notification System
 

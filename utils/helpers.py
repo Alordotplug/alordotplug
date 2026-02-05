@@ -3,12 +3,74 @@ Helper utilities for the bot.
 """
 import logging
 from typing import List, Optional
-from telegram import Update
+from telegram import Update, User
 from telegram.ext import ContextTypes
 
 from configs.config import Config
 
 logger = logging.getLogger(__name__)
+
+# Admin commands fallback text constant
+ADMIN_COMMANDS_FALLBACK = (
+    "\n\n👨‍💼 Admin Commands:\n"
+    "• /start - Welcome message\n"
+    "• /menu - View catalog\n"
+    "• /users - Manage users\n"
+    "• /send - Send message to user\n"
+    "• /broadcast - Broadcast to all users\n"
+    "• /setcontact - Set order contact\n"
+    "• /recategorize - Recategorize products\n"
+    "• /nuke - Delete all products"
+)
+
+
+def escape_markdown_v1(text: str) -> str:
+    """
+    Escape special characters for Telegram's legacy Markdown (v1) format.
+    
+    In Markdown v1, only these characters need escaping:
+    - _ (underscore) for italic
+    - * (asterisk) for bold
+    - ` (backtick) for code
+    - [ (left bracket) for links
+    
+    Args:
+        text: Text to escape
+        
+    Returns:
+        Escaped text safe for Markdown v1
+    """
+    # Escape special Markdown v1 characters
+    # Note: We don't escape backslash itself as user names typically don't contain them,
+    # and escaping backslash would require escaping it first to avoid double-escaping
+    text = text.replace('_', r'\_')
+    text = text.replace('*', r'\*')
+    text = text.replace('`', r'\`')
+    text = text.replace('[', r'\[')
+    return text
+
+
+def get_user_display_name(user: User, escaped: bool = True) -> str:
+    """
+    Get a user's display name with fallback logic.
+    
+    Args:
+        user: Telegram User object
+        escaped: Whether to escape markdown characters for Markdown v1 (default: True)
+    
+    Returns:
+        User's display name (first + last name, or first name, or username, or "there")
+    """
+    if user.first_name and user.last_name:
+        raw_display_name = f"{user.first_name} {user.last_name}"
+    elif user.first_name:
+        raw_display_name = user.first_name
+    elif user.username:
+        raw_display_name = user.username
+    else:
+        raw_display_name = "there"
+    
+    return escape_markdown_v1(raw_display_name) if escaped else raw_display_name
 
 
 def get_admin_ids() -> List[int]:
