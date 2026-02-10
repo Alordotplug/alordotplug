@@ -28,7 +28,7 @@ from handlers.admin import (
     delete_product, nuke_command, recategorize_command, 
     users_command, show_users_page,
     block_command, unblock_command, send_command, broadcast_command,
-    setcontact_command, handle_setcontact_input
+    setcontact_command, handle_setcontact_input, clearcache_command
 )
 from translations.language_config import is_valid_language, LANGUAGE_DISPLAY
 from translations.translator import get_translated_string_async, translation_service
@@ -104,23 +104,27 @@ async def notify_admins_for_categorization(context: ContextTypes.DEFAULT_TYPE, p
             f"Please select a category:"
         )
         
-        # Send notification to each admin
-        for admin_id in admin_ids:
-            try:
-                # Send the product media with categorization keyboard
-                from utils.helpers import send_media_message
-                
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=message_text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard
-                )
-                
-                logger.info(f"Sent categorization request to admin {admin_id} for product {product_id}")
-                
-            except Exception as e:
-                logger.error(f"Failed to notify admin {admin_id}: {e}")
+        # Get primary admin ID (use PRIMARY_ADMIN_ID if configured, otherwise use first admin)
+        from configs.config import Config
+        primary_admin = Config.PRIMARY_ADMIN_ID or (admin_ids[0] if admin_ids else None)
+
+        if not primary_admin:
+            logger.warning("No primary admin configured. Product will remain uncategorized.")
+            return
+
+        # Send notification only to primary admin
+        try:
+            await context.bot.send_message(
+                chat_id=primary_admin,
+                text=message_text,
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+            
+            logger.info(f"Sent categorization request to primary admin {primary_admin} for product {product_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to notify primary admin {primary_admin}: {e}")
         
         # Mark as pending categorization
         await db.add_pending_categorization(product_id)
@@ -158,9 +162,10 @@ async def process_media_group(media_group_id: str, chat_id: int, context: Contex
     if not caption:
         caption = f"[Album - {len(messages)} items]"
     
-    # Collect all file IDs
+    # Collect all file IDs and message IDs
     file_ids = []
     file_types = []
+    message_ids = []
     
     for msg in messages:
         # Create a temporary update object for each message
@@ -169,6 +174,7 @@ async def process_media_group(media_group_id: str, chat_id: int, context: Contex
         if file_id:
             file_ids.append(file_id)
             file_types.append(file_type)
+            message_ids.append(msg.message_id)
     
     if not file_ids:
         logger.warning(f"No file IDs extracted from media group {media_group_id}")
@@ -178,14 +184,16 @@ async def process_media_group(media_group_id: str, chat_id: int, context: Contex
     existing_product_id = await db.get_or_create_media_group_product(media_group_id, chat_id)
     
     if existing_product_id:
-        # Update existing product with new file IDs
+        # Update existing product with new file IDs and message IDs
         additional_files = json.dumps(list(zip(file_ids[1:], file_types[1:])))
-        await db.update_product_media(existing_product_id, additional_files)
+        additional_msg_ids = json.dumps(message_ids[1:]) if len(message_ids) > 1 else None
+        await db.update_product_media(existing_product_id, additional_files, additional_msg_ids)
         logger.info(f"Updated media group product {existing_product_id} with {len(file_ids)} files")
         return
     
     # Create new product with first file as primary (NO automatic categorization)
     additional_files = json.dumps(list(zip(file_ids[1:], file_types[1:]))) if len(file_ids) > 1 else None
+    additional_msg_ids = json.dumps(message_ids[1:]) if len(message_ids) > 1 else None
     
     product_id = await db.add_product(
         file_id=file_ids[0],
@@ -195,8 +203,10 @@ async def process_media_group(media_group_id: str, chat_id: int, context: Contex
         chat_id=chat_id,
         media_group_id=media_group_id,
         additional_file_ids=additional_files,
+        additional_message_ids=additional_msg_ids,
         category=None,  # No automatic categorization
-        subcategory=None
+        subcategory=None,
+        bot_username=context.bot.username
     )
     
     if product_id > 0:
@@ -272,17 +282,20 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             message_id=message.message_id,
             chat_id=message.chat.id,
             category=None,  # No automatic categorization
-            subcategory=None
+            subcategory=None,
+            bot_username=context.bot.username
         )
         
         if product_id > 0:
             logger.info(
                 f"New product saved: ID={product_id}, "
                 f"message_id={message.message_id}, "
-                f"type={file_type}"
+                f"type={file_type}, "
+                f"bot={context.bot.username}"
             )
             
             # Notify admins for categorization
+            logger.info(f"Sending categorization request for product {product_id} (bot: {context.bot.username})")
             await notify_admins_for_categorization(context, product_id)
         else:
             logger.debug(f"Product already exists for message {message.message_id}")
@@ -440,7 +453,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 return
             
             # Send the message
-            from utils.notifications import NotificationService
             notification_service = NotificationService(db)
             
             success = await notification_service.send_custom_message_to_user(
@@ -480,7 +492,6 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
         )
         
         # Broadcast using notification service
-        from utils.notifications import NotificationService
         notification_service = NotificationService(db)
         
         queued_count = await notification_service.broadcast_custom_message(
@@ -713,8 +724,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 logger.info(f"Product {product_id} categorized as {category}/{subcategory} by admin {update.effective_user.id}")
                 
                 # Notify subscribed users about the new categorized product
+                logger.info(f"Triggering notifications for categorized product {product_id}")
                 notification_service = NotificationService(db)
                 await notification_service.notify_users_about_product(context, product_id)
+                logger.info(f"Notification service called for product {product_id}")
             else:
                 await query.answer("Invalid save data", show_alert=True)
         
@@ -921,7 +934,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                         [InlineKeyboardButton("🔕 Unsubscribe", callback_data="toggle_notifications")]
                     ])
                     await query.edit_message_reply_markup(reply_markup=unsubscribe_keyboard)
-                except:
+                except Exception as e:
+                    logger.debug(f"Could not edit message markup: {e}")
                     pass  # Message may not have markup to edit
                 
                 await query.answer("✅ You have been subscribed to notifications successfully! You will now receive updates about new products.", show_alert=True)
@@ -939,7 +953,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     [InlineKeyboardButton("🔔 Resubscribe to Notifications", callback_data="toggle_notifications")]
                 ])
                 await query.edit_message_reply_markup(reply_markup=resubscribe_keyboard)
-            except:
+            except Exception as e:
+                logger.debug(f"Could not edit message markup: {e}")
                 pass  # Message may not have markup to edit
             
             await query.answer("✅ You have been unsubscribed from notifications successfully. You can resubscribe anytime using the 'Resubscribe to Notifications' button or /subscribe command.", show_alert=True)
@@ -954,7 +969,8 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                     [InlineKeyboardButton("🔕 Unsubscribe", callback_data="toggle_notifications")]
                 ])
                 await query.edit_message_reply_markup(reply_markup=original_keyboard)
-            except:
+            except Exception as e:
+                logger.debug(f"Could not edit message markup: {e}")
                 pass  # Message may not have markup to edit
             
             await query.answer("✅ Unsubscribe cancelled", show_alert=False)
@@ -1097,11 +1113,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Track user
     user = update.effective_user
+    bot_username = context.bot.username if hasattr(context.bot, 'username') else None
     await db.track_user(
         user_id=user.id,
         username=user.username,
         first_name=user.first_name,
-        last_name=user.last_name
+        last_name=user.last_name,
+        bot_username=bot_username
     )
     
     # Check if user is blocked
@@ -1164,7 +1182,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 text="❌ An unexpected error occurred. Please try again later."
             )
-        except:
+        except Exception as e:
+            logger.debug(f"Could not send error message to user: {e}")
             pass
 
 
@@ -1196,41 +1215,63 @@ async def post_init(application: Application):
 
 
 async def setup_bot_commands(bot):
-    """Set up bot commands that appear in the Telegram command menu."""
+    """
+    Set up bot commands that appear in the Telegram command menu.
+    
+    This function configures the command menu that users see when they click the menu
+    button next to the message input field in Telegram. It sets different commands for
+    regular users vs admins.
+    
+    **IMPORTANT**: This function is called automatically during bot initialization in
+    both polling mode (main.py) and webhook mode (webhook_server.py) via post_init().
+    This ensures that ALL bot instances (primary and secondary) have consistent command
+    menus regardless of which bot token is used.
+    
+    Args:
+        bot: The Telegram bot instance
+    """
     # Define user commands (available to all users)
-    # Removed: language, subscribe, unsubscribe per requirements
+    # These appear in the command menu for all users
     user_commands = [
         BotCommand("start", "Start the bot and select language"),
         BotCommand("menu", "Browse the product catalog"),
     ]
     
     # Define admin commands (available to admins only)
-    # Removed: block, unblock per requirements
+    # These appear in the command menu ONLY for admin users
     admin_commands = user_commands + [
         BotCommand("users", "View and manage bot users"),
         BotCommand("send", "Send a message to a specific user"),
         BotCommand("broadcast", "Send a message to all users"),
         BotCommand("setcontact", "Set order contact username"),
         BotCommand("recategorize", "Categorize uncategorized products"),
+        BotCommand("clearcache", "Clear file ID cache"),
         BotCommand("nuke", "Delete all products (use with caution)"),
     ]
     
     # Set default commands for all users
+    # This updates the global command menu seen by regular users
     await bot.set_my_commands(user_commands)
+    logger.info(f"Set user commands globally: {[cmd.command for cmd in user_commands]}")
     
-    # Set admin commands for each admin
+    # Set admin-specific commands for each admin user
+    # This overrides the global commands for admin chat scopes
     admin_ids = get_admin_ids()
+    if not admin_ids:
+        logger.warning("No admin IDs configured - admin commands will not be set")
+    
     for admin_id in admin_ids:
         try:
             await bot.set_my_commands(
                 admin_commands,
                 scope=BotCommandScopeChat(chat_id=admin_id)
             )
-            logger.info(f"Set admin commands for user {admin_id}")
+            logger.info(f"Set admin commands for user {admin_id}: {[cmd.command for cmd in admin_commands]}")
         except Exception as e:
             logger.warning(f"Could not set admin commands for {admin_id}: {e}")
     
-    logger.info("Bot commands configured successfully")
+    logger.info("Bot commands configured successfully - menu will be consistent across all bot instances")
+
 
 
 def main():
@@ -1269,6 +1310,7 @@ def main():
     application.add_handler(CommandHandler("send", send_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("setcontact", setcontact_command))
+    application.add_handler(CommandHandler("clearcache", clearcache_command))
     
     # Channel post handler (for monitoring channel)
     channel_id = get_channel_id()

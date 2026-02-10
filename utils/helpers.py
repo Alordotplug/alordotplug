@@ -2,9 +2,11 @@
 Helper utilities for the bot.
 """
 import logging
-from typing import List, Optional
+import json
+from typing import List, Optional, Dict, Tuple
 from telegram import Update, User
 from telegram.ext import ContextTypes
+from telegram.error import Forbidden
 
 from configs.config import Config
 
@@ -195,11 +197,175 @@ async def send_media_message(
                 reply_markup=reply_markup
             )
     except Exception as e:
+        error_msg = str(e)
         logger.error(f"Error sending media message: {e}")
+        
+        # Provide helpful error messages based on the error type
+        fallback_text = caption or 'Media'
+        if "Wrong file identifier" in error_msg or "file_id" in error_msg.lower():
+            fallback_text += (
+                "\n\n⚠️ Media temporarily unavailable (file ID issue).\n"
+                "If this persists, please report this product to an admin."
+            )
+        else:
+            fallback_text += f"\n\n⚠️ Error displaying media."
+        
         # Fallback to text message
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"{caption or 'Media'}\n\n⚠️ Error displaying media. File ID: {file_id}",
+            text=fallback_text,
             reply_markup=reply_markup
         )
 
+
+async def get_bot_specific_file_id(
+    context: ContextTypes.DEFAULT_TYPE,
+    source_chat_id: int,
+    source_message_id: int,
+    file_type: str,
+    file_index: int = 0
+) -> Optional[str]:
+    """
+    Get bot-specific file ID by forwarding a message from the source chat.
+    This is necessary when a secondary bot needs to display media that was
+    originally posted to a channel using a different bot.
+    
+    Uses persistent database cache to survive bot restarts.
+    
+    Args:
+        context: Bot context
+        source_chat_id: ID of the source chat (usually the channel)
+        source_message_id: ID of the specific message containing the media
+        file_type: Type of file (photo, video, document, etc.)
+        file_index: Index of the file (0 for single media, 0..n for media groups)
+    
+    Returns:
+        Bot-specific file ID or None if forwarding fails
+    """
+    from database import Database
+    db = Database()
+    
+    # Get current bot username
+    bot_username = context.bot.username
+    if not bot_username:
+        logger.error("Bot username not available - cannot cache file ID")
+        return None
+    
+    # Check persistent database cache first
+    cached_file_id = await db.get_bot_file_id(
+        source_chat_id,
+        source_message_id,
+        file_index,
+        bot_username
+    )
+    
+    if cached_file_id:
+        logger.debug(f"Using cached file ID for bot {bot_username}, message {source_message_id}, index {file_index}")
+        return cached_file_id
+    
+    # Cache miss - need to get bot-specific file ID by forwarding
+    try:
+        # Forward the message to get the bot-specific file ID
+        # We forward to one of the admin users (they have permission to receive)
+        admin_ids = get_admin_ids()
+        if not admin_ids:
+            logger.error("No admin IDs configured - cannot get bot-specific file ID")
+            return None
+        
+        target_chat_id = admin_ids[0]
+        
+        # Forward the message
+        forwarded = await context.bot.forward_message(
+            chat_id=target_chat_id,
+            from_chat_id=source_chat_id,
+            message_id=source_message_id
+        )
+        
+        # Extract the file ID from the forwarded message
+        file_id = None
+        
+        if file_type == "photo" and forwarded.photo:
+            file_id = forwarded.photo[-1].file_id
+        elif file_type == "video" and forwarded.video:
+            file_id = forwarded.video.file_id
+        elif file_type == "document" and forwarded.document:
+            file_id = forwarded.document.file_id
+        elif file_type == "animation" and forwarded.animation:
+            file_id = forwarded.animation.file_id
+        elif file_type == "video_note" and forwarded.video_note:
+            file_id = forwarded.video_note.file_id
+        elif file_type == "audio" and forwarded.audio:
+            file_id = forwarded.audio.file_id
+        elif file_type == "voice" and forwarded.voice:
+            file_id = forwarded.voice.file_id
+        
+        if file_id:
+            # Cache the result in database for persistence
+            await db.cache_bot_file_id(
+                source_chat_id,
+                source_message_id,
+                file_index,
+                file_type,
+                bot_username,
+                file_id
+            )
+            logger.info(f"Cached bot-specific file ID for {bot_username}: msg={source_message_id}, idx={file_index}")
+            
+            # Delete the forwarded message to avoid cluttering admin chat
+            try:
+                await context.bot.delete_message(
+                    chat_id=target_chat_id,
+                    message_id=forwarded.message_id
+                )
+            except Exception as e:
+                logger.warning(f"Could not delete forwarded message: {e}")
+            
+            return file_id
+        else:
+            logger.warning(f"Could not extract file ID from forwarded message {source_message_id}")
+            
+            # Still try to delete the forwarded message
+            try:
+                await context.bot.delete_message(
+                    chat_id=target_chat_id,
+                    message_id=forwarded.message_id
+                )
+            except Exception as e:
+                logger.warning(f"Could not delete forwarded message: {e}")
+            
+            return None
+            
+    except Forbidden as e:
+        # Handle "bot can't initiate conversation with a user" error
+        error_msg = str(e)
+        if "can't initiate conversation" in error_msg.lower() or "bot was blocked" in error_msg.lower():
+            logger.warning(
+                f"Unable to forward message to admin {target_chat_id} for bot-specific file ID: {e}\n"
+                f"SOLUTION: Admin with ID {target_chat_id} needs to start a conversation with this bot "
+                f"by sending /start to it. This is required for secondary bots to cache media file IDs."
+            )
+        else:
+            logger.error(f"Forbidden error getting bot-specific file ID: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error getting bot-specific file ID: {e}")
+        return None
+
+
+async def clear_file_id_cache():
+    """Clear the bot-specific file ID cache (useful for forcing refresh of old entries)."""
+    from database import Database
+    db = Database()
+    deleted = await db.clear_bot_file_id_cache()
+    logger.info(f"File ID cache cleared: {deleted} entries removed from database")
+    return deleted
+
+
+async def get_file_id_cache_size() -> int:
+    """Get the current size of the file ID cache."""
+    from database import Database
+    db = Database()
+    async with db.get_connection() as conn:
+        async with conn.execute("SELECT COUNT(*) FROM bot_file_id_cache") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0

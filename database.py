@@ -3,9 +3,12 @@ Database models and operations for the media catalog bot.
 Uses SQLite with aiosqlite for async operations.
 """
 import aiosqlite
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any, Tuple
+from collections import defaultdict
 import logging
+import asyncio
+from functools import lru_cache
 
 from configs.config import Config
 
@@ -14,12 +17,27 @@ logger = logging.getLogger(__name__)
 # Default values
 DEFAULT_ORDER_CONTACT = '@FLYAWAYPEP'
 
+# In-memory caches for frequently accessed data
+_user_language_cache: Dict[int, Tuple[str, datetime]] = {}
+_order_contact_cache: Optional[Tuple[str, datetime]] = None
+_cache_lock = asyncio.Lock()
+CACHE_TTL_SECONDS = 300  # 5 minutes
+
 
 class Database:
     """Database manager for product catalog."""
     
     def __init__(self, db_path: str = None):
         self.db_path = db_path or Config.DB_PATH
+    
+    def get_connection(self):
+        """Get a database connection context manager."""
+        return aiosqlite.connect(self.db_path)
+    
+    @staticmethod
+    def normalize_bot_username(bot_username: Optional[str]) -> Optional[str]:
+        """Normalize bot username to lowercase for consistent database lookups."""
+        return bot_username.lower() if bot_username else None
     
     async def init_db(self):
         """Initialize database with schema."""
@@ -34,6 +52,7 @@ class Database:
                     chat_id INTEGER NOT NULL,
                     media_group_id TEXT,
                     additional_file_ids TEXT,
+                    additional_message_ids TEXT,
                     category TEXT,
                     subcategory TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -146,6 +165,22 @@ class Database:
                 )
             """)
             
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_file_id_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_chat_id INTEGER NOT NULL,
+                    source_message_id INTEGER NOT NULL,
+                    file_index INTEGER DEFAULT 0,
+                    file_type TEXT NOT NULL,
+                    bot_username TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    use_count INTEGER DEFAULT 1,
+                    UNIQUE(source_chat_id, source_message_id, file_index, bot_username)
+                )
+            """)
+            
             # Set default order contact if not exists
             await db.execute("""
                 INSERT OR IGNORE INTO bot_settings (key, value)
@@ -179,14 +214,46 @@ class Database:
                 pass
             
             try:
+                await db.execute("ALTER TABLE bot_users ADD COLUMN bot_username TEXT")
+            except aiosqlite.OperationalError:
+                pass
+            
+            try:
                 await db.execute("ALTER TABLE bot_users ADD COLUMN is_blocked INTEGER DEFAULT 0")
             except aiosqlite.OperationalError:
                 pass
             
             try:
-                await db.execute("ALTER TABLE bot_users ADD COLUMN language TEXT DEFAULT 'en'")
+                await db.execute("ALTER TABLE products ADD COLUMN bot_username TEXT")
             except aiosqlite.OperationalError:
                 pass
+            
+            try:
+                await db.execute("ALTER TABLE bot_users ADD COLUMN language TEXT DEFAULT 'en'")
+                logger.info("Added 'language' column to bot_users table")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column" in str(e).lower():
+                    logger.debug("Column 'language' already exists in bot_users table")
+                else:
+                    logger.warning(f"Could not add 'language' column to bot_users: {e}")
+            
+            try:
+                await db.execute("ALTER TABLE products ADD COLUMN additional_message_ids TEXT")
+                logger.info("Added 'additional_message_ids' column to products table")
+            except aiosqlite.OperationalError as e:
+                if "duplicate column" in str(e).lower():
+                    logger.debug("Column 'additional_message_ids' already exists in products table")
+                else:
+                    logger.warning(f"Could not add 'additional_message_ids' column to products: {e}")
+            
+            # Migrate existing media groups to populate additional_message_ids
+            # For media groups created before this fix, infer message IDs from sequential ordering
+            logger.info("Checking for media groups needing message ID migration...")
+            await self._migrate_existing_media_groups(db)
+            
+            # Check for products without bot_username
+            logger.info("Checking for products needing bot_username migration...")
+            await self._migrate_bot_username_for_existing_products(db)
             
             # Create performance-critical indexes
             logger.info("Creating database indexes...")
@@ -220,6 +287,88 @@ class Database:
             await db.commit()
             logger.info("Database initialized successfully")
     
+    async def _migrate_existing_media_groups(self, db):
+        """
+        Migrate existing media groups to populate additional_message_ids.
+        For media groups created before this fix, we infer message IDs based on
+        the assumption that media group messages are sent sequentially.
+        """
+        try:
+            # Find all products with additional_file_ids but no additional_message_ids
+            cursor = await db.execute("""
+                SELECT id, message_id, additional_file_ids
+                FROM products
+                WHERE additional_file_ids IS NOT NULL 
+                  AND additional_file_ids != ''
+                  AND (additional_message_ids IS NULL OR additional_message_ids = '')
+            """)
+            products_to_migrate = await cursor.fetchall()
+            
+            if not products_to_migrate:
+                logger.info("No media groups need message ID migration")
+                return
+            
+            logger.info(f"Found {len(products_to_migrate)} media groups needing message ID migration")
+            
+            migrated_count = 0
+            for product_id, first_message_id, additional_file_ids_json in products_to_migrate:
+                try:
+                    # Parse the additional file IDs to get the count
+                    import json
+                    file_data = json.loads(additional_file_ids_json)
+                    num_additional_files = len(file_data)
+                    
+                    # Infer sequential message IDs starting from first_message_id + 1
+                    # This assumes Telegram sends media group messages sequentially
+                    additional_msg_ids = [first_message_id + i + 1 for i in range(num_additional_files)]
+                    additional_msg_ids_json = json.dumps(additional_msg_ids)
+                    
+                    # Update the product
+                    await db.execute("""
+                        UPDATE products 
+                        SET additional_message_ids = ?
+                        WHERE id = ?
+                    """, (additional_msg_ids_json, product_id))
+                    
+                    migrated_count += 1
+                    logger.debug(f"Migrated product {product_id}: inferred {num_additional_files} message IDs")
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to migrate product {product_id}: {e}")
+                    continue
+            
+            await db.commit()
+            logger.info(f"Successfully migrated {migrated_count} media groups with inferred message IDs")
+            
+        except Exception as e:
+            logger.error(f"Error during media group migration: {e}")
+    
+    async def _migrate_bot_username_for_existing_products(self, db):
+        """
+        Migrate existing products to populate bot_username.
+        For products created before this fix, we set bot_username to None
+        which will trigger bot-specific file ID resolution on first access.
+        """
+        try:
+            # Count products without bot_username
+            cursor = await db.execute("""
+                SELECT COUNT(*) FROM products
+                WHERE bot_username IS NULL
+            """)
+            row = await cursor.fetchone()
+            count = row[0] if row else 0
+            
+            if count == 0:
+                logger.info("All products already have bot_username populated")
+                return
+            
+            logger.info(f"Found {count} products without bot_username - they will use fallback file ID resolution")
+            # Note: We don't need to do anything here - products with NULL bot_username
+            # will automatically trigger bot-specific file ID resolution when accessed
+            
+        except Exception as e:
+            logger.error(f"Error checking bot_username migration: {e}")
+    
     async def add_product(
         self,
         file_id: str,
@@ -229,21 +378,24 @@ class Database:
         chat_id: int,
         media_group_id: Optional[str] = None,
         additional_file_ids: Optional[str] = None,
+        additional_message_ids: Optional[str] = None,
         category: Optional[str] = None,
-        subcategory: Optional[str] = None
+        subcategory: Optional[str] = None,
+        bot_username: Optional[str] = None
     ) -> int:
         """Add a new product to the database."""
         async with aiosqlite.connect(self.db_path) as db:
             try:
                 cursor = await db.execute("""
                     INSERT INTO products (file_id, file_type, caption, message_id, chat_id, 
-                                        media_group_id, additional_file_ids, category, subcategory, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        media_group_id, additional_file_ids, additional_message_ids, category, subcategory, bot_username, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (file_id, file_type, caption or "", message_id, chat_id, 
-                      media_group_id, additional_file_ids, category, subcategory, datetime.now()))
+                      media_group_id, additional_file_ids, additional_message_ids, category, subcategory, 
+                      self.normalize_bot_username(bot_username), datetime.now()))
                 await db.commit()
                 product_id = cursor.lastrowid
-                logger.info(f"Product added: ID={product_id}, message_id={message_id}, category={category}")
+                logger.info(f"Product added: ID={product_id}, message_id={message_id}, category={category}, bot={bot_username}")
                 return product_id
             except aiosqlite.IntegrityError:
                 logger.warning(f"Product already exists: message_id={message_id}, chat_id={chat_id}")
@@ -510,12 +662,12 @@ class Database:
             """, (media_group_id, chat_id, product_id, datetime.now()))
             await db.commit()
     
-    async def update_product_media(self, product_id: int, additional_file_ids: str):
-        """Update a product's additional file IDs for media groups."""
+    async def update_product_media(self, product_id: int, additional_file_ids: str, additional_message_ids: str = None):
+        """Update a product's additional file IDs and message IDs for media groups."""
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                UPDATE products SET additional_file_ids = ? WHERE id = ?
-            """, (additional_file_ids, product_id))
+                UPDATE products SET additional_file_ids = ?, additional_message_ids = ? WHERE id = ?
+            """, (additional_file_ids, additional_message_ids, product_id))
             await db.commit()
     
     async def get_products_by_category(self, category: str, limit: int = None, offset: int = 0) -> List[Dict[str, Any]]:
@@ -636,8 +788,16 @@ class Database:
                 return [row[0] for row in rows]
     
     async def track_user(self, user_id: int, username: Optional[str] = None, 
-                        first_name: Optional[str] = None, last_name: Optional[str] = None):
-        """Track or update a bot user."""
+                        first_name: Optional[str] = None, last_name: Optional[str] = None,
+                        bot_username: Optional[str] = None):
+        """
+        Track or update a bot user.
+        
+        Note: bot_username is only set/updated if the database value is NULL.
+        - On first interaction: bot_username is recorded
+        - On subsequent interactions: bot_username is preserved (not overwritten)
+        - This ensures analytics show which bot the user first interacted with
+        """
         async with aiosqlite.connect(self.db_path) as db:
             # Check if user exists
             async with db.execute("SELECT user_id FROM bot_users WHERE user_id = ?", (user_id,)) as cursor:
@@ -648,15 +808,16 @@ class Database:
                 await db.execute("""
                     UPDATE bot_users 
                     SET username = ?, first_name = ?, last_name = ?, 
-                        last_seen = ?, interaction_count = interaction_count + 1
+                        last_seen = ?, interaction_count = interaction_count + 1,
+                        bot_username = COALESCE(?, bot_username)
                     WHERE user_id = ?
-                """, (username, first_name, last_name, datetime.now(), user_id))
+                """, (username, first_name, last_name, datetime.now(), bot_username, user_id))
             else:
                 # Insert new user
                 await db.execute("""
-                    INSERT INTO bot_users (user_id, username, first_name, last_name, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (user_id, username, first_name, last_name, datetime.now(), datetime.now()))
+                    INSERT INTO bot_users (user_id, username, first_name, last_name, first_seen, last_seen, bot_username)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (user_id, username, first_name, last_name, datetime.now(), datetime.now(), bot_username))
             
             await db.commit()
     
@@ -701,6 +862,16 @@ class Database:
                 row = await cursor.fetchone()
                 return row[0] if row else 0
     
+    async def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Get user details by user ID."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("""
+                SELECT * FROM bot_users WHERE user_id = ?
+            """, (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+    
     async def user_exists(self, user_id: int) -> bool:
         """Check if a user exists in the database."""
         async with aiosqlite.connect(self.db_path) as db:
@@ -733,13 +904,87 @@ class Database:
         from utils.helpers import get_admin_ids
         admin_ids = get_admin_ids()
         
+        if not admin_ids:
+            # No admins to filter, simple query
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute("""
+                    SELECT user_id FROM bot_users WHERE notifications_enabled = 1
+                """) as cursor:
+                    rows = await cursor.fetchall()
+                    return [row[0] for row in rows]
+        
+        # Filter admins in SQL for better performance
+        # Build placeholders safely - length is controlled by admin_ids count
+        num_admins = len(admin_ids)
+        placeholders = ','.join(['?'] * num_admins)
+        query = f"""
+            SELECT user_id FROM bot_users 
+            WHERE notifications_enabled = 1 
+            AND user_id NOT IN ({placeholders})
+        """
         async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(query, admin_ids) as cursor:
+                rows = await cursor.fetchall()
+                return [row[0] for row in rows]
+    
+    async def get_subscribed_users_by_bot(self) -> Dict[str, List[int]]:
+        """
+        Get list of user IDs with notifications enabled, grouped by bot_username.
+        Returns a dict mapping bot_username to list of user_ids.
+        Users without a bot_username are included under None key.
+        Excludes admins.
+        """
+        from utils.helpers import get_admin_ids
+        admin_ids = get_admin_ids()
+        
+        result = defaultdict(list)
+        
+        if not admin_ids:
+            # No admins to filter, simple query
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                async with db.execute("""
+                    SELECT user_id, bot_username FROM bot_users 
+                    WHERE notifications_enabled = 1
+                """) as cursor:
+                    rows = await cursor.fetchall()
+                    for row in rows:
+                        result[row['bot_username']].append(row['user_id'])
+                    return dict(result)
+        
+        # Filter admins in SQL for better performance
+        num_admins = len(admin_ids)
+        placeholders = ','.join(['?'] * num_admins)
+        query = f"""
+            SELECT user_id, bot_username FROM bot_users 
+            WHERE notifications_enabled = 1 
+            AND user_id NOT IN ({placeholders})
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, admin_ids) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    result[row['bot_username']].append(row['user_id'])
+                return dict(result)
+    
+    async def get_all_users_by_bot(self) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Get all users grouped by bot_username.
+        Returns a dict mapping bot_username to list of user dicts.
+        Users without a bot_username are included under None key.
+        """
+        result = defaultdict(list)
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
             async with db.execute("""
-                SELECT user_id FROM bot_users WHERE notifications_enabled = 1
+                SELECT * FROM bot_users ORDER BY last_seen DESC
             """) as cursor:
                 rows = await cursor.fetchall()
-                # Filter out admin IDs
-                return [row[0] for row in rows if row[0] not in admin_ids]
+                for row in rows:
+                    user_dict = dict(row)
+                    result[user_dict.get('bot_username')].append(user_dict)
+                return dict(result)
     
     async def queue_notification(self, user_id: int, product_id: int):
         """Add a notification to the queue."""
@@ -849,16 +1094,35 @@ class Database:
                 return row[0] if row else 0
     
     async def get_user_language(self, user_id: int) -> str:
-        """Get user's preferred language."""
+        """Get user's preferred language with caching."""
+        global _user_language_cache
+        
+        # Check cache first
+        async with _cache_lock:
+            if user_id in _user_language_cache:
+                lang, cached_at = _user_language_cache[user_id]
+                # Return cached value if not expired
+                if datetime.now() - cached_at < timedelta(seconds=CACHE_TTL_SECONDS):
+                    return lang
+        
+        # Cache miss or expired - query database
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("""
                 SELECT language FROM bot_users WHERE user_id = ?
             """, (user_id,)) as cursor:
                 row = await cursor.fetchone()
-                return row[0] if row else 'en'
+                lang = row[0] if row else 'en'
+        
+        # Update cache
+        async with _cache_lock:
+            _user_language_cache[user_id] = (lang, datetime.now())
+        
+        return lang
     
     async def set_user_language(self, user_id: int, language: str):
-        """Set user's preferred language."""
+        """Set user's preferred language and invalidate cache."""
+        global _user_language_cache
+        
         async with aiosqlite.connect(self.db_path) as db:
             # Check if user exists
             async with db.execute("SELECT user_id FROM bot_users WHERE user_id = ?", (user_id,)) as cursor:
@@ -877,6 +1141,10 @@ class Database:
                 """, (user_id, language, datetime.now(), datetime.now()))
             
             await db.commit()
+        
+        # Invalidate cache for this user
+        async with _cache_lock:
+            _user_language_cache[user_id] = (language, datetime.now())
     
     async def get_cached_translation(
         self,
@@ -963,16 +1231,35 @@ class Database:
             logger.info(f"Cleaned up translations older than {days_old} days")
     
     async def get_order_contact(self) -> str:
-        """Get the order contact username from settings."""
+        """Get the order contact username from settings with caching."""
+        global _order_contact_cache
+        
+        # Check cache first
+        async with _cache_lock:
+            if _order_contact_cache is not None:
+                contact, cached_at = _order_contact_cache
+                # Return cached value if not expired
+                if datetime.now() - cached_at < timedelta(seconds=CACHE_TTL_SECONDS):
+                    return contact
+        
+        # Cache miss or expired - query database
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("""
                 SELECT value FROM bot_settings WHERE key = 'order_contact'
             """) as cursor:
                 row = await cursor.fetchone()
-                return row[0] if row else DEFAULT_ORDER_CONTACT
+                contact = row[0] if row else DEFAULT_ORDER_CONTACT
+        
+        # Update cache
+        async with _cache_lock:
+            _order_contact_cache = (contact, datetime.now())
+        
+        return contact
     
     async def set_order_contact(self, contact: str):
-        """Set the order contact username in settings."""
+        """Set the order contact username in settings and invalidate cache."""
+        global _order_contact_cache
+        
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
                 INSERT OR REPLACE INTO bot_settings (key, value, updated_at)
@@ -980,6 +1267,79 @@ class Database:
             """, (contact, datetime.now()))
             await db.commit()
             logger.info(f"Order contact updated to: {contact}")
+        
+        # Invalidate cache
+        async with _cache_lock:
+            _order_contact_cache = (contact, datetime.now())
+    
+    async def get_bot_file_id(
+        self,
+        source_chat_id: int,
+        source_message_id: int,
+        file_index: int,
+        bot_username: str
+    ) -> Optional[str]:
+        """Get cached bot-specific file ID from database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT file_id FROM bot_file_id_cache
+                WHERE source_chat_id = ? AND source_message_id = ? 
+                  AND file_index = ? AND bot_username = ?
+            """, (source_chat_id, source_message_id, file_index, bot_username.lower())) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    # Update usage stats
+                    await db.execute("""
+                        UPDATE bot_file_id_cache
+                        SET last_used = ?, use_count = use_count + 1
+                        WHERE source_chat_id = ? AND source_message_id = ? 
+                          AND file_index = ? AND bot_username = ?
+                    """, (datetime.now(), source_chat_id, source_message_id, file_index, bot_username.lower()))
+                    await db.commit()
+                    return row[0]
+                return None
+    
+    async def cache_bot_file_id(
+        self,
+        source_chat_id: int,
+        source_message_id: int,
+        file_index: int,
+        file_type: str,
+        bot_username: str,
+        file_id: str
+    ):
+        """Cache a bot-specific file ID in database."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO bot_file_id_cache 
+                (source_chat_id, source_message_id, file_index, file_type, bot_username, file_id, created_at, last_used, use_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (source_chat_id, source_message_id, file_index, file_type, 
+                  self.normalize_bot_username(bot_username), file_id, datetime.now(), datetime.now()))
+            await db.commit()
+            logger.debug(f"Cached file ID for bot {bot_username}: msg={source_message_id}, idx={file_index}")
+    
+    async def clear_bot_file_id_cache(self):
+        """Clear all bot-specific file ID caches (for admin /clearcache command)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("DELETE FROM bot_file_id_cache")
+            deleted = cursor.rowcount
+            await db.commit()
+            logger.info(f"Cleared {deleted} bot file ID cache entries")
+            return deleted
+
+
+async def clear_database_caches():
+    """Clear all in-memory database caches. Useful for testing or after bulk updates."""
+    global _user_language_cache, _order_contact_cache
+    
+    async with _cache_lock:
+        _user_language_cache.clear()
+        _order_contact_cache = None
+    
+    logger.info("Database caches cleared")
+
+
 
     
 

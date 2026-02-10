@@ -3,10 +3,10 @@ Product view handler.
 """
 import logging
 import json
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ContextTypes
 from database import Database
-from utils.helpers import send_media_message, is_admin
+from utils.helpers import send_media_message, is_admin, get_bot_specific_file_id
 from utils.pagination import paginate_items
 from utils.categories import format_category_info
 from translations.translator import translate_text_async, get_translated_string_async
@@ -142,12 +142,66 @@ async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, produ
             try:
                 file_data = json.loads(additional_file_ids)
                 
+                # Check if we need bot-specific file ID resolution
+                product_bot = product.get("bot_username")
+                current_bot = context.bot.username
+                # Handle None values for bot usernames
+                needs_bot_specific_ids = (
+                    product_bot is None or 
+                    current_bot is None or 
+                    product_bot.lower() != current_bot.lower()
+                )
+                
+                # Parse additional message IDs if available
+                additional_message_ids_json = product.get("additional_message_ids")
+                message_ids = []
+                use_bot_specific_ids = False
+                
+                if additional_message_ids_json:
+                    try:
+                        additional_msg_ids = json.loads(additional_message_ids_json)
+                        # Build complete message ID list: [first_message_id, ...additional_message_ids]
+                        message_ids = [product["message_id"]] + additional_msg_ids
+                        # Use bot-specific IDs if different bot OR no message IDs stored
+                        use_bot_specific_ids = needs_bot_specific_ids
+                    except (json.JSONDecodeError, TypeError) as e:
+                        logger.warning(f"Failed to parse additional_message_ids: {e}")
+                        use_bot_specific_ids = False
+                else:
+                    # No message IDs - need bot-specific resolution if different bot
+                    if needs_bot_specific_ids:
+                        # We need message IDs for bot-specific resolution
+                        # Estimate sequential message IDs (may not be accurate for all cases)
+                        logger.warning(
+                            f"Product {product_id} has no stored message IDs - estimating sequential IDs. "
+                            f"This may fail if messages weren't sent sequentially."
+                        )
+                        # Build message ID list from the first message ID with correct sequential numbering
+                        # message_ids[0] = base, message_ids[1] = base+1, message_ids[2] = base+2, etc.
+                        message_ids = [product["message_id"] + i for i in range(len(file_data) + 1)]
+                        use_bot_specific_ids = True
+                    else:
+                        use_bot_specific_ids = False
+                
                 # Prepare media list
                 media_list = []
                 
                 # Add first media (with caption)
                 first_type = product["file_type"]
                 first_id = product["file_id"]
+                chat_id = product["chat_id"]
+                
+                # Try to get bot-specific file ID for the first media if message IDs are available
+                if use_bot_specific_ids:
+                    bot_specific_id = await get_bot_specific_file_id(
+                        context,
+                        chat_id,
+                        message_ids[0],
+                        first_type,
+                        file_index=0
+                    )
+                    # Use bot-specific ID if available, otherwise fall back to original
+                    first_id = bot_specific_id or first_id
                 
                 if first_type == "photo":
                     media_list.append(InputMediaPhoto(media=first_id, caption=full_caption))
@@ -166,8 +220,32 @@ async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, produ
                     await update.callback_query.answer()
                     return
                 
-                # Add additional media
-                for file_id, file_type in file_data:
+                # Add additional media with bot-specific file IDs if available
+                for idx, (file_id, file_type) in enumerate(file_data, start=1):
+                    if use_bot_specific_ids:
+                        # Verify we have a message ID for this file
+                        if idx < len(message_ids):
+                            # Get the corresponding message ID
+                            msg_id = message_ids[idx]
+                            
+                            # Try to get bot-specific file ID
+                            bot_specific_id = await get_bot_specific_file_id(
+                                context,
+                                chat_id,
+                                msg_id,
+                                file_type,
+                                file_index=idx
+                            )
+                            
+                            # Use bot-specific ID if available, otherwise fall back to original
+                            file_id = bot_specific_id or file_id
+                        else:
+                            # Message ID missing for this file - log warning and use original
+                            logger.warning(
+                                f"Message ID missing for file {idx} in product {product_id} "
+                                f"(have {len(message_ids)} IDs, need {len(file_data)+1})"
+                            )
+                    
                     if file_type == "photo":
                         media_list.append(InputMediaPhoto(media=file_id))
                     elif file_type == "video":
@@ -200,10 +278,33 @@ async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, produ
                 # Fall back to single media
         
         # Send single media with caption
+        # Check if we need bot-specific file ID
+        product_bot = product.get("bot_username")
+        current_bot = context.bot.username
+        file_id_to_use = product["file_id"]
+        
+        # Handle None values for bot usernames
+        if (product_bot is None or 
+            current_bot is None or 
+            product_bot.lower() != current_bot.lower()):
+            # Try to get bot-specific file ID for single media
+            bot_specific_id = await get_bot_specific_file_id(
+                context,
+                product["chat_id"],
+                product["message_id"],
+                product["file_type"],
+                file_index=0
+            )
+            if bot_specific_id:
+                file_id_to_use = bot_specific_id
+                logger.debug(f"Using bot-specific file ID for product {product_id}")
+            else:
+                logger.warning(f"Could not get bot-specific file ID for product {product_id}, using original")
+        
         await send_media_message(
             context,
             update.effective_chat.id,
-            product["file_id"],
+            file_id_to_use,
             product["file_type"],
             caption=full_caption,
             reply_markup=None  # Don't add keyboard to media message

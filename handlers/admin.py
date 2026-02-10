@@ -123,6 +123,12 @@ async def show_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pa
                 f"   📬 Notifications: {notif_status}"
             )
             
+            # Add bot username if available
+            bot_username = user.get('bot_username')
+            if bot_username:
+                escaped_bot_username = escape_markdown_v1(f"@{bot_username}")
+                user_text += f"\n   🤖 Bot: {escaped_bot_username}"
+            
             # Add blocked status if applicable
             if blocked_status:
                 user_text += f"\n   ⚠️ Status: {blocked_status}"
@@ -666,6 +672,39 @@ async def handle_setcontact_input(update: Update, context: ContextTypes.DEFAULT_
         parse_mode="Markdown"
     )
     logger.info(f"Admin {user_id} updated order contact to: {contact}")
+
+
+async def clearcache_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /clearcache command - clear the file ID cache (admin only)."""
+    user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        await update.message.reply_text(
+            "❌ This command is only available for administrators."
+        )
+        return
+    
+    try:
+        # Import the cache clearing function
+        from utils.helpers import clear_file_id_cache
+        
+        # Clear the cache
+        deleted_count = await clear_file_id_cache()
+        
+        await update.message.reply_text(
+            f"✅ **File ID cache cleared successfully!**\n\n"
+            f"Removed {deleted_count} cached file ID entries.\n"
+            f"Old product entries will now refresh their media on next view.\n"
+            f"This is useful after adding secondary bots as channel admins.",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Admin {user_id} cleared the file ID cache ({deleted_count} entries)")
+        
+    except Exception as e:
+        logger.error(f"Error in clearcache command: {e}", exc_info=True)
+        await update.message.reply_text(
+            "❌ An error occurred while clearing the cache."
+        )
 
 
 
