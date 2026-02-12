@@ -10,6 +10,7 @@ from typing import List
 from fastapi import FastAPI, Request, Response, status
 from telegram import Update
 from telegram.ext import Application
+from telegram.request import HTTPXRequest
 
 from configs.config import Config, ConfigError
 # Import the bot setup functions
@@ -35,6 +36,7 @@ from main import (
     message_handler,
     error_handler
 )
+from handlers.admin import botusers_command, prunebots_command
 from telegram.ext import (
     CommandHandler,
     MessageHandler,
@@ -65,8 +67,18 @@ def get_bot_applications() -> List[Application]:
     return _bot_applications
 
 def get_bot_usernames() -> List[str]:
-    """Get list of bot usernames for all registered bots."""
-    return [bot.bot.username for bot in _bot_applications if hasattr(bot, 'bot') and hasattr(bot.bot, 'username')]
+    """Get list of bot usernames for all registered bots (normalized to lowercase)."""
+    usernames = []
+    for bot in _bot_applications:
+        if hasattr(bot, 'bot') and hasattr(bot.bot, 'username') and bot.bot.username is not None:
+            usernames.append(bot.bot.username.lower())
+        else:
+            # Log if a bot is missing username for debugging
+            if hasattr(bot, 'bot'):
+                logger.warning(f"Bot application has no username or username is None")
+            else:
+                logger.warning(f"Bot application has no 'bot' attribute")
+    return usernames
 
 
 async def setup_application(bot_token: str, bot_index: int = 0):
@@ -78,15 +90,16 @@ async def setup_application(bot_token: str, bot_index: int = 0):
     """
     logger.info(f"Setting up bot application {bot_index}...")
     
-    # Create application
-    bot_app = Application.builder().token(bot_token).build()
+    # Create application with optimized timeout settings
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        connect_timeout=10.0,
+        read_timeout=10.0,
+        write_timeout=10.0,
+        pool_timeout=5.0
+    )
     
-    # Initialize database (only once for the primary bot)
-    if bot_index == 0:
-        await post_init(bot_app)
-    else:
-        # For secondary bots, set commands
-        await setup_bot_commands(bot_app.bot)
+    bot_app = Application.builder().token(bot_token).request(request).build()
     
     # Register handlers
     bot_app.add_handler(CommandHandler("start", start_command))
@@ -103,6 +116,8 @@ async def setup_application(bot_token: str, bot_index: int = 0):
     bot_app.add_handler(CommandHandler("broadcast", broadcast_command))
     bot_app.add_handler(CommandHandler("setcontact", setcontact_command))
     bot_app.add_handler(CommandHandler("clearcache", clearcache_command))
+    bot_app.add_handler(CommandHandler("botusers", botusers_command))
+    bot_app.add_handler(CommandHandler("prunebots", prunebots_command))
     
     # Channel post handler (for monitoring channel)
     # Only the primary bot (bot_index == 0) should monitor the channel and send categorization requests
@@ -146,8 +161,17 @@ async def setup_application(bot_token: str, bot_index: int = 0):
     bot_app.add_error_handler(error_handler)
     
     # Initialize the application
+    # IMPORTANT: Must be called before any bot API methods (like set_my_commands)
     await bot_app.initialize()
     await bot_app.start()
+    
+    # Initialize database and set bot commands (only once for the primary bot)
+    # NOTE: This must happen AFTER bot_app.initialize() to avoid "Frozen_method_invalid" errors
+    if bot_index == 0:
+        await post_init(bot_app)
+    else:
+        # For secondary bots, set commands
+        await setup_bot_commands(bot_app.bot)
     
     # Set webhook
     webhook_url = Config.WEBHOOK_URL

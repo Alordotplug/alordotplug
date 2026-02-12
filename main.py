@@ -15,7 +15,7 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
 
 from configs.config import Config, ConfigError
 from database import Database
@@ -26,9 +26,10 @@ from handlers.product_view import show_product, handle_product_callback
 from handlers.language import language_command, handle_language_callback
 from handlers.admin import (
     delete_product, nuke_command, recategorize_command, 
-    users_command, show_users_page,
+    users_command, show_users_page, build_users_bot_selection_menu,
     block_command, unblock_command, send_command, broadcast_command,
-    setcontact_command, handle_setcontact_input, clearcache_command
+    setcontact_command, handle_setcontact_input, clearcache_command,
+    botusers_command, prunebots_command
 )
 from translations.language_config import is_valid_language, LANGUAGE_DISPLAY
 from translations.translator import get_translated_string_async, translation_service
@@ -66,10 +67,55 @@ user_last_message = {}
 # Media group collection (temporary storage for grouping messages)
 media_group_messages = {}
 media_group_timers = {}
+media_group_locks = {}  # Locks to prevent race conditions in media group processing
+
+# Callback query configuration
+LONG_RUNNING_CALLBACKS = ["broadcast_confirm_all"]  # Callbacks that should not answer query upfront to avoid timeouts
+
+
+def _is_primary_instance(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Check if this is the primary bot instance.
+    Only the primary bot (first token in BOT_TOKENS) should create notification queues.
+    
+    Args:
+        context: Telegram context with bot information
+        
+    Returns:
+        True if this is the primary instance, False otherwise
+    """
+    if not hasattr(context, 'bot') or not hasattr(context.bot, 'token'):
+        # If we can't determine, assume it's primary to maintain backward compatibility
+        logger.warning("Unable to determine bot instance, assuming primary")
+        return True
+    
+    current_token = context.bot.token
+    bot_tokens = Config.BOT_TOKENS
+    
+    # Validate BOT_TOKENS is a non-empty list
+    if not bot_tokens or not isinstance(bot_tokens, list) or len(bot_tokens) == 0:
+        # No tokens configured or invalid configuration, assume primary
+        return True
+    
+    # Primary bot is the first token in the list (index 0)
+    is_primary = current_token == bot_tokens[0]
+    
+    if not is_primary:
+        logger.debug(f"Skipping operation - not primary instance (bot token: ...{current_token[-5:]})")
+    
+    return is_primary
+
 
 
 async def notify_admins_for_categorization(context: ContextTypes.DEFAULT_TYPE, product_id: int):
-    """Send categorization request to all admins for a new product."""
+    """Send categorization request to all admins for a new product.
+    Only runs on the primary bot instance to avoid duplicate notifications.
+    """
+    # Check if this is the primary bot instance
+    if not _is_primary_instance(context):
+        logger.info(f"Skipping categorization notification for product {product_id} - not primary instance")
+        return
+    
     try:
         product = await db.get_product(product_id)
         if not product:
@@ -137,11 +183,17 @@ async def process_media_group(media_group_id: str, chat_id: int, context: Contex
     """Process collected media group messages after a short delay."""
     await asyncio.sleep(0.5)  # Wait for all messages in the group to arrive
     
-    if media_group_id not in media_group_messages:
-        return
+    # Get or create a lock for this media group to prevent race conditions
+    if media_group_id not in media_group_locks:
+        media_group_locks[media_group_id] = asyncio.Lock()
     
-    messages = media_group_messages.pop(media_group_id, [])
-    media_group_timers.pop(media_group_id, None)
+    async with media_group_locks[media_group_id]:
+        if media_group_id not in media_group_messages:
+            return
+        
+        messages = media_group_messages.pop(media_group_id, [])
+        media_group_timers.pop(media_group_id, None)
+        media_group_locks.pop(media_group_id, None)  # Clean up the lock
     
     if not messages:
         return
@@ -319,9 +371,12 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             )
             return
     
-    await query.answer()  # Answer callback to prevent loading spinner
-    
     callback_data = query.data
+    
+    # Don't answer callback query upfront for long-running operations
+    # These callbacks will answer the query themselves to avoid timeout errors
+    if callback_data not in LONG_RUNNING_CALLBACKS:
+        await query.answer()  # Answer callback to prevent loading spinner
     
     # Handle language selection callbacks from /language command
     if callback_data.startswith("setlang|"):
@@ -484,30 +539,31 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data.clear()
             return
         
+        # Answer query immediately to prevent timeout during long operation
+        await query.answer()
+        
         # Send status message
         await query.edit_message_text(
             "📡 **Broadcasting message...**\n\n"
-            "Please wait while the message is queued for all users.",
+            "Please wait while the message is queued and delivered to all users.",
             parse_mode="Markdown"
         )
         
         # Broadcast using notification service
         notification_service = NotificationService(db)
         
-        queued_count = await notification_service.broadcast_custom_message(
+        stats = await notification_service.broadcast_custom_message(
             context,
             message_text,
-            exclude_blocked=True
+            exclude_blocked=True,
+            admin_user_id=user_id
         )
         
-        await query.edit_message_text(
-            f"✅ **Broadcast Complete**\n\n"
-            f"📨 Messages queued: {queued_count}\n"
-            f"📝 Message: {message_text[:100]}{'...' if len(message_text) > 100 else ''}\n\n"
-            f"Messages will be delivered with rate-limiting intervals.",
-            parse_mode="Markdown"
-        )
-        logger.info(f"Admin {user_id} broadcast message to {queued_count} users")
+        # Note: The detailed summary is sent separately by the notification service
+        # Failure count = permanent failures (blocked + not_found + unexpected_errors)
+        # Excludes markdown_errors (successfully sent as plain text) and rate_limited (queued for later)
+        total_failures = stats.get('blocked', 0) + stats.get('not_found', 0) + stats.get('unexpected_errors', 0)
+        logger.info(f"Admin {user_id} broadcast complete: {stats.get('sent', 0)} sent, {total_failures} failed")
         
         context.user_data.clear()
         return
@@ -642,13 +698,30 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                         reply_markup=keyboard
                     )
                 else:
-                    # No subcategories, save directly
+                    # No subcategories, save directly and ask for notification confirmation
                     await db.update_product_category(product_id, category, None)
+                    
+                    # Translate category name
+                    category_key = f"category_{category.lower()}"
+                    translated_category = await get_translated_string_async(category_key, user_lang)
+                    if translated_category == category_key:
+                        translated_category = get_category_display_name(category)
+                    
+                    # Ask admin if they want to send notifications
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Yes, send notifications", callback_data=f"send_notif_yes|{product_id}")],
+                        [InlineKeyboardButton("❌ No, skip notifications", callback_data=f"send_notif_no|{product_id}")]
+                    ])
+                    
                     await query.edit_message_text(
                         f"✅ Product #{product_id} categorized as:\n"
-                        f"📂 {get_category_display_name(category)}"
+                        f"📂 {translated_category}\n\n"
+                        f"📢 **Send notifications to subscribed users?**\n"
+                        f"Choose whether to notify users about this product:",
+                        reply_markup=keyboard,
+                        parse_mode="Markdown"
                     )
-                    logger.info(f"Product {product_id} categorized as {category} by admin {update.effective_user.id}")
+                    logger.info(f"Product {product_id} categorized as {category} by admin {update.effective_user.id}, awaiting notification decision")
             else:
                 await query.answer("Invalid category data", show_alert=True)
         
@@ -717,19 +790,70 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 
                 success_msg = await get_translated_string_async("product_categorized_successfully", user_lang, product_id=product_id)
                 
+                # Ask admin if they want to send notifications for this product
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, send notifications", callback_data=f"send_notif_yes|{product_id}")],
+                    [InlineKeyboardButton("❌ No, skip notifications", callback_data=f"send_notif_no|{product_id}")]
+                ])
+                
                 await query.edit_message_text(
                     f"{success_msg}\n\n"
-                    f"📂 {category_text}"
+                    f"📂 {category_text}\n\n"
+                    f"📢 **Send notifications to subscribed users?**\n"
+                    f"Choose whether to notify users about this product:",
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
                 )
-                logger.info(f"Product {product_id} categorized as {category}/{subcategory} by admin {update.effective_user.id}")
-                
-                # Notify subscribed users about the new categorized product
-                logger.info(f"Triggering notifications for categorized product {product_id}")
-                notification_service = NotificationService(db)
-                await notification_service.notify_users_about_product(context, product_id)
-                logger.info(f"Notification service called for product {product_id}")
+                logger.info(f"Product {product_id} categorized as {category}/{subcategory} by admin {update.effective_user.id}, awaiting notification decision")
             else:
                 await query.answer("Invalid save data", show_alert=True)
+        
+        # Handle notification confirmation - YES
+        elif parts[0] == "send_notif_yes":
+            if len(parts) >= 2:
+                product_id = int(parts[1])
+                
+                # Check if user is admin
+                if not is_admin(update.effective_user.id):
+                    await query.answer("❌ Only admins can manage notifications.", show_alert=True)
+                    return
+                
+                # Send notifications
+                logger.info(f"Admin approved notifications for product {product_id}")
+                await query.edit_message_text(
+                    f"✅ **Notifications sent!**\n\n"
+                    f"📢 Subscribed users are being notified about product #{product_id}.\n\n"
+                    f"Notifications are being sent in batches to avoid spam limits.",
+                    parse_mode="Markdown"
+                )
+                
+                # Trigger notifications
+                notification_service = NotificationService(db)
+                await notification_service.notify_users_about_product(context, product_id)
+                logger.info(f"Notification service triggered for product {product_id}")
+            else:
+                await query.answer("Invalid notification data", show_alert=True)
+        
+        # Handle notification confirmation - NO
+        elif parts[0] == "send_notif_no":
+            if len(parts) >= 2:
+                product_id = int(parts[1])
+                
+                # Check if user is admin
+                if not is_admin(update.effective_user.id):
+                    await query.answer("❌ Only admins can manage notifications.", show_alert=True)
+                    return
+                
+                # Skip notifications
+                logger.info(f"Admin skipped notifications for product {product_id}")
+                await query.edit_message_text(
+                    f"✅ **Categorization complete**\n\n"
+                    f"📂 Product #{product_id} has been categorized.\n"
+                    f"🔕 No notifications will be sent for this product.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.answer("Invalid notification data", show_alert=True)
         
         # Handle category browsing
         elif parts[0] == "category":
@@ -829,6 +953,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             if len(parts) >= 2:
                 target_user_id = int(parts[1])
                 page = int(parts[2]) if len(parts) > 2 else 1
+                bot_username = parts[3] if len(parts) > 3 else None
                 
                 # Get current status
                 is_subscribed = await db.is_user_subscribed(target_user_id)
@@ -842,16 +967,17 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 
                 # Replace with confirmation buttons
                 try:
+                    bot_param = f"|{bot_username}" if bot_username else ""
                     confirmation_keyboard = InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"✅ Yes, {action_text.title()} Notifications", callback_data=f"confirm_toggle_notif|{target_user_id}|{page}|{int(is_subscribed)}")],
-                        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_toggle_notif|{page}")]
+                        [InlineKeyboardButton(f"✅ Yes, {action_text.title()} Notifications", callback_data=f"confirm_toggle_notif|{target_user_id}|{page}|{int(is_subscribed)}{bot_param}")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_toggle_notif|{page}{bot_param}")]
                     ])
                     await query.edit_message_reply_markup(reply_markup=confirmation_keyboard)
                 except Exception as e:
                     logger.error(f"Error showing notification toggle confirmation: {e}")
                     # Fallback to just toggling
                     await db.set_user_notifications(target_user_id, not is_subscribed)
-                    await show_users_page(update, context, page)
+                    await show_users_page(update, context, page, bot_username)
                     status_text = "disabled" if is_subscribed else "enabled"
                     await query.answer(f"✅ Notifications {status_text} for user", show_alert=False)
                     logger.info(f"Admin {update.effective_user.id} toggled notifications for user {target_user_id} to {not is_subscribed}")
@@ -868,12 +994,13 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 target_user_id = int(parts[1])
                 page = int(parts[2])
                 was_subscribed = bool(int(parts[3])) if len(parts) > 3 else False
+                bot_username = parts[4] if len(parts) > 4 else None
                 
                 # Toggle notifications
                 await db.set_user_notifications(target_user_id, not was_subscribed)
                 
                 # Refresh the users page
-                await show_users_page(update, context, page)
+                await show_users_page(update, context, page, bot_username)
                 
                 status_text = "disabled" if was_subscribed else "enabled"
                 await query.answer(f"✅ Notifications {status_text} for user successfully", show_alert=True)
@@ -889,9 +1016,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             if len(parts) >= 1:
                 page = int(parts[1]) if len(parts) > 1 else 1
+                bot_username = parts[2] if len(parts) > 2 else None
                 
                 # Refresh the users page
-                await show_users_page(update, context, page)
+                await show_users_page(update, context, page, bot_username)
                 
                 await query.answer("✅ Toggle cancelled", show_alert=False)
             else:
@@ -904,7 +1032,51 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 return
             
             page = int(parts[1]) if len(parts) > 1 else 1
-            await show_users_page(update, context, page)
+            bot_username = parts[2] if len(parts) > 2 else None
+            await show_users_page(update, context, page, bot_username)
+        
+        # Handle viewusers callback (view users for specific bot)
+        elif parts[0] == "viewusers":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can view users.", show_alert=True)
+                return
+            
+            if len(parts) >= 2:
+                bot_username = parts[1]
+                page = int(parts[2]) if len(parts) > 2 else 1
+                
+                await query.answer()
+                await show_users_page(update, context, page, bot_username)
+            else:
+                await query.answer("Invalid data", show_alert=True)
+        
+        # Handle back to bot list from users view
+        elif callback_data == "users_back_to_bots":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can view users.", show_alert=True)
+                return
+            
+            await query.answer()
+            
+            # Build bot selection menu using helper function
+            keyboard, message, message_no_md, has_bots, bot_list = await build_users_bot_selection_menu()
+            
+            if not has_bots:
+                await query.edit_message_text("No bot usernames found.")
+                return
+            
+            try:
+                await query.edit_message_text(
+                    message,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+            except BadRequest as e:
+                logger.warning(f"Markdown parse error in users_back_to_bots, retrying without parse_mode: {e}")
+                await query.edit_message_text(
+                    message_no_md,
+                    reply_markup=keyboard
+                )
         
         # Handle notification toggle (subscribe/unsubscribe)
         elif callback_data == "toggle_notifications":
@@ -999,6 +1171,7 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             if len(parts) >= 2:
                 target_user_id = int(parts[1])
                 page = int(parts[2]) if len(parts) > 2 else 1
+                bot_username = parts[3] if len(parts) > 3 else None
                 
                 # Prevent blocking admins
                 if is_admin(target_user_id):
@@ -1014,16 +1187,17 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
                 # Replace the block button with confirmation buttons
                 try:
                     # Update the message to show confirmation buttons
+                    bot_param = f"|{bot_username}" if bot_username else ""
                     confirmation_keyboard = InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Yes, Block User", callback_data=f"confirm_block|{target_user_id}|{page}")],
-                        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_block|{page}")]
+                        [InlineKeyboardButton("✅ Yes, Block User", callback_data=f"confirm_block|{target_user_id}|{page}{bot_param}")],
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_block|{page}{bot_param}")]
                     ])
                     await query.edit_message_reply_markup(reply_markup=confirmation_keyboard)
                 except Exception as e:
                     logger.error(f"Error showing block confirmation: {e}")
                     # Fallback to just blocking
                     await db.block_user(target_user_id)
-                    await show_users_page(update, context, page)
+                    await show_users_page(update, context, page, bot_username)
                     await query.answer("🚫 User blocked", show_alert=False)
                     logger.info(f"Admin {update.effective_user.id} blocked user {target_user_id}")
             else:
@@ -1038,12 +1212,13 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             if len(parts) >= 2:
                 target_user_id = int(parts[1])
                 page = int(parts[2]) if len(parts) > 2 else 1
+                bot_username = parts[3] if len(parts) > 3 else None
                 
                 # Block the user
                 await db.block_user(target_user_id)
                 
                 # Refresh the users page
-                await show_users_page(update, context, page)
+                await show_users_page(update, context, page, bot_username)
                 
                 await query.answer("✅ User has been blocked successfully", show_alert=True)
                 logger.info(f"Admin {update.effective_user.id} blocked user {target_user_id}")
@@ -1058,9 +1233,10 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             
             if len(parts) >= 1:
                 page = int(parts[1]) if len(parts) > 1 else 1
+                bot_username = parts[2] if len(parts) > 2 else None
                 
                 # Refresh the users page
-                await show_users_page(update, context, page)
+                await show_users_page(update, context, page, bot_username)
                 
                 await query.answer("✅ Block cancelled", show_alert=False)
             else:
@@ -1075,17 +1251,273 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
             if len(parts) >= 2:
                 target_user_id = int(parts[1])
                 page = int(parts[2]) if len(parts) > 2 else 1
+                bot_username = parts[3] if len(parts) > 3 else None
                 
                 # Unblock the user
                 await db.unblock_user(target_user_id)
                 
                 # Refresh the users page
-                await show_users_page(update, context, page)
+                await show_users_page(update, context, page, bot_username)
                 
                 await query.answer("✅ User has been unblocked successfully", show_alert=True)
                 logger.info(f"Admin {update.effective_user.id} unblocked user {target_user_id}")
             else:
                 await query.answer("Invalid data", show_alert=True)
+        
+        # Handle view bot users
+        elif parts[0] == "viewbotusers":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can view users.", show_alert=True)
+                return
+            
+            if len(parts) >= 2:
+                bot_username = parts[1]
+                page = int(parts[2]) if len(parts) > 2 else 1
+                
+                from handlers.admin import show_bot_users_page
+                await show_bot_users_page(update, context, bot_username, page)
+            else:
+                await query.answer("Invalid data", show_alert=True)
+        
+        # Handle back to bot list
+        elif parts[0] == "backto_botlist":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can view users.", show_alert=True)
+                return
+            
+            # Display the bot list inline (duplicates botusers_command logic for callback context)
+            await query.answer()
+            
+            bot_usernames = await db.get_bot_usernames()
+            keyboard_buttons = []
+            
+            for bot_username in bot_usernames:
+                count = await db.get_users_count_by_bot(bot_username)
+                display_text = f"@{bot_username} ({count} users)"
+                keyboard_buttons.append([
+                    InlineKeyboardButton(display_text, callback_data=f"viewbotusers|{bot_username}|1")
+                ])
+            
+            untracked_count = await db.get_users_count_by_bot("_untracked_")
+            if untracked_count > 0:
+                keyboard_buttons.append([
+                    InlineKeyboardButton(f"Untracked Users ({untracked_count})", callback_data="viewbotusers|_untracked_|1")
+                ])
+            
+            keyboard = InlineKeyboardMarkup(keyboard_buttons)
+            total_users = await db.get_users_count_by_bot()
+            
+            await query.edit_message_text(
+                f"📊 **Bot Users by Instance**\n\n"
+                f"Total Users: {total_users}\n"
+                f"Bot Instances: {len(bot_usernames)}\n\n"
+                f"Select a bot to view its users:",
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        
+        # Handle delete single user
+        elif parts[0] == "deleteuser":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can delete users.", show_alert=True)
+                return
+            
+            if len(parts) >= 4:
+                target_user_id = int(parts[1])
+                bot_username = parts[2]
+                page = int(parts[3])
+                
+                # Get user info before deletion
+                user = await db.get_user_by_id(target_user_id)
+                
+                if not user:
+                    await query.answer("User not found", show_alert=True)
+                    return
+                
+                username = user.get("username", "N/A")
+                first_name = user.get("first_name", "Unknown")
+                
+                # Create confirmation keyboard
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_deleteuser|{target_user_id}|{bot_username}|{page}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"viewbotusers|{bot_username}|{page}")]
+                ])
+                
+                await query.edit_message_text(
+                    f"⚠️ **Delete User Confirmation**\n\n"
+                    f"User ID: `{target_user_id}`\n"
+                    f"Username: @{username if username != 'N/A' else 'none'}\n"
+                    f"Name: {first_name}\n\n"
+                    f"This will completely remove the user from the database.\n"
+                    f"The user can restart the bot to be re-added as a fresh user.\n\n"
+                    f"Are you sure?",
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                await query.answer()
+            else:
+                await query.answer("Invalid data", show_alert=True)
+        
+        # Handle confirm delete user
+        elif parts[0] == "confirm_deleteuser":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can delete users.", show_alert=True)
+                return
+            
+            if len(parts) >= 2:
+                target_user_id = int(parts[1])
+                bot_username = parts[2] if len(parts) > 2 else None
+                page = int(parts[3]) if len(parts) > 3 else 1
+                
+                # Delete the user
+                await db.delete_user(target_user_id)
+                
+                await query.answer("✅ User deleted successfully", show_alert=True)
+                logger.info(f"Admin {update.effective_user.id} deleted user {target_user_id}")
+                
+                # If we have bot_username, go back to that page, otherwise close
+                if bot_username:
+                    from handlers.admin import show_bot_users_page
+                    await show_bot_users_page(update, context, bot_username, page)
+                else:
+                    await query.edit_message_text(
+                        f"✅ User `{target_user_id}` has been deleted successfully.",
+                        parse_mode="Markdown"
+                    )
+            else:
+                await query.answer("Invalid data", show_alert=True)
+        
+        # Handle delete all users from a bot
+        elif parts[0] == "deleteallbot":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can delete users.", show_alert=True)
+                return
+            
+            if len(parts) >= 2:
+                bot_username = parts[1]
+                
+                # Get count
+                if bot_username == "_untracked_":
+                    count = await db.get_users_count_by_bot("_untracked_")
+                    display_name = "Untracked Users"
+                else:
+                    count = await db.get_users_count_by_bot(bot_username)
+                    display_name = f"@{bot_username}"
+                
+                # Create confirmation keyboard
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Yes, Delete All", callback_data=f"confirm_deleteallbot|{bot_username}")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"viewbotusers|{bot_username}|1")]
+                ])
+                
+                await query.edit_message_text(
+                    f"⚠️ **BULK DELETE WARNING**\n\n"
+                    f"You are about to delete **{count}** user(s) from {display_name}.\n\n"
+                    f"This will completely remove all these users from the database.\n"
+                    f"Users can restart the bot to be re-added as fresh users.\n\n"
+                    f"This action cannot be undone!\n\n"
+                    f"Are you sure?",
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                await query.answer()
+            else:
+                await query.answer("Invalid data", show_alert=True)
+        
+        # Handle confirm delete all users from bot
+        elif parts[0] == "confirm_deleteallbot":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can delete users.", show_alert=True)
+                return
+            
+            if len(parts) >= 2:
+                bot_username = parts[1]
+                
+                # Delete all users from this bot
+                deleted_count = await db.delete_users_by_bot(bot_username)
+                
+                await query.answer(f"✅ Deleted {deleted_count} users", show_alert=True)
+                logger.info(f"Admin {update.effective_user.id} deleted {deleted_count} users from bot {bot_username}")
+                
+                # Go back to bot list
+                bot_usernames = await db.get_bot_usernames()
+                keyboard_buttons = []
+                
+                for bot_username_item in bot_usernames:
+                    count = await db.get_users_count_by_bot(bot_username_item)
+                    display_text = f"@{bot_username_item} ({count} users)"
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(display_text, callback_data=f"viewbotusers|{bot_username_item}|1")
+                    ])
+                
+                untracked_count = await db.get_users_count_by_bot("_untracked_")
+                if untracked_count > 0:
+                    keyboard_buttons.append([
+                        InlineKeyboardButton(f"Untracked Users ({untracked_count})", callback_data="viewbotusers|_untracked_|1")
+                    ])
+                
+                keyboard = InlineKeyboardMarkup(keyboard_buttons)
+                total_users = await db.get_users_count_by_bot()
+                
+                await query.edit_message_text(
+                    f"📊 **Bot Users by Instance**\n\n"
+                    f"Total Users: {total_users}\n"
+                    f"Bot Instances: {len(bot_usernames)}\n\n"
+                    f"✅ Deleted {deleted_count} users successfully.\n\n"
+                    f"Select a bot to view its users:",
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.answer("Invalid data", show_alert=True)
+        
+        # Handle confirm prune bots
+        elif parts[0] == "confirm_prunebots":
+            if not is_admin(update.effective_user.id):
+                await query.answer("❌ Only admins can prune bots.", show_alert=True)
+                return
+            
+            # Get active bot usernames from webhook server
+            from webhook_server import get_bot_usernames
+            active_bots = get_bot_usernames()
+            
+            if not active_bots:
+                await query.answer("⚠️ No active bots found!", show_alert=True)
+                return
+            
+            # Perform pruning
+            stats = await db.prune_inactive_bot_users(active_bots, dry_run=False)
+            
+            if stats['users'] == 0:
+                await query.edit_message_text(
+                    "✅ **No Changes Made**\n\n"
+                    "No users found associated with inactive bots.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.edit_message_text(
+                    f"✅ **Pruning Complete**\n\n"
+                    f"Deleted:\n"
+                    f"• Users: {stats['users']}\n"
+                    f"• Products: {stats['products']}\n"
+                    f"• Pending Notifications: {stats['notifications']}\n"
+                    f"• Custom Messages: {stats['custom_messages']}\n\n"
+                    f"Remaining active bots ({len(active_bots)}):\n"
+                    f"• " + "\n• ".join(f"@{bot}" for bot in sorted(active_bots)),
+                    parse_mode="Markdown"
+                )
+                logger.info(f"Admin {update.effective_user.id} pruned inactive bot users: {stats}")
+            
+            await query.answer("✅ Pruning complete", show_alert=False)
+        
+        # Handle cancel prune bots
+        elif parts[0] == "cancel_prunebots":
+            await query.edit_message_text(
+                "❌ **Pruning Cancelled**\n\n"
+                "No changes were made.",
+                parse_mode="Markdown"
+            )
+            await query.answer("Cancelled", show_alert=False)
         
         else:
             await query.answer("Unknown action", show_alert=True)
@@ -1093,6 +1525,14 @@ async def callback_query_handler(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError as e:
         logger.error(f"Invalid callback data format: {callback_data}, error: {e}")
         await query.answer("Invalid action", show_alert=True)
+    except BadRequest as e:
+        # Handle "Message is not modified" error silently
+        if "message is not modified" in str(e).lower():
+            logger.debug(f"Message not modified for callback {callback_data}: {e}")
+            await query.answer()  # Silent acknowledgment
+        else:
+            logger.error(f"BadRequest error handling callback query: {e}", exc_info=True)
+            await query.answer("Unable to process this action. Please try again.", show_alert=True)
     except Exception as e:
         logger.error(f"Error handling callback query: {e}", exc_info=True)
         await query.answer("An error occurred", show_alert=True)
@@ -1165,7 +1605,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors."""
-    logger.error(f"Update {update} caused error {context.error}")
+    # Log error with full context and traceback
+    update_info = "unknown"
+    if update:
+        if update.effective_user:
+            update_info = f"user {update.effective_user.id}"
+        elif update.effective_chat:
+            update_info = f"chat {update.effective_chat.id}"
+        update_info += f" (update_id: {update.update_id})"
+    
+    logger.error(f"Update from {update_info} caused error: {context.error}", exc_info=True)
     
     if isinstance(context.error, TelegramError):
         if "message is not modified" in str(context.error).lower():
@@ -1188,7 +1637,14 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cleanup_task(context: ContextTypes.DEFAULT_TYPE):
-    """Periodic cleanup task for old pagination states."""
+    """Periodic cleanup task for old pagination states.
+    Only runs on the primary bot instance to avoid duplicate cleanup.
+    """
+    # Check if this is the primary bot instance
+    if not _is_primary_instance(context):
+        logger.info("Cleanup task disabled - not primary instance")
+        return
+    
     while True:
         try:
             await asyncio.sleep(600)  # Run every 10 minutes
@@ -1241,11 +1697,13 @@ async def setup_bot_commands(bot):
     # These appear in the command menu ONLY for admin users
     admin_commands = user_commands + [
         BotCommand("users", "View and manage bot users"),
+        BotCommand("botusers", "View users grouped by bot instance"),
         BotCommand("send", "Send a message to a specific user"),
         BotCommand("broadcast", "Send a message to all users"),
         BotCommand("setcontact", "Set order contact username"),
         BotCommand("recategorize", "Categorize uncategorized products"),
         BotCommand("clearcache", "Clear file ID cache"),
+        BotCommand("prunebots", "Prune users from inactive bots"),
         BotCommand("nuke", "Delete all products (use with caution)"),
     ]
     
@@ -1303,6 +1761,8 @@ def main():
     application.add_handler(CommandHandler("nuke", nuke_command))
     application.add_handler(CommandHandler("recategorize", recategorize_command))
     application.add_handler(CommandHandler("users", users_command))
+    application.add_handler(CommandHandler("botusers", botusers_command))
+    application.add_handler(CommandHandler("prunebots", prunebots_command))
     application.add_handler(CommandHandler("subscribe", subscribe_command))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe_command))
     application.add_handler(CommandHandler("block", block_command))

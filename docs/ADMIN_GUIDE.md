@@ -25,12 +25,39 @@ Browse products by category - available to all users
 - Click category to view filtered products
 
 ### `/users`
-View and manage bot users (admin only)
-- Shows 10 users per page with pagination
-- Displays: username, full name, ID, interaction count, last seen, **notification status**, **bot username** (which bot instance they used)
+View and manage bot users grouped by bot instance (admin only)
+- **Multi-bot setups**: Shows bot selection menu, choose which bot's users to manage
+- **Single-bot setups**: Automatically shows users (no selection needed)
+- Displays: username, full name, ID, interaction count, last seen, notification status
 - **Toggle notifications** for individual users with one click
+- **Block/unblock users** to prevent/allow bot access
 - Navigate pages with ⬅️ Previous / ➡️ Next buttons
-- Useful for monitoring bot engagement, analytics across multiple bot instances, and controlling who gets notifications
+- Useful for monitoring bot engagement and controlling who gets notifications
+
+### `/botusers`
+View users grouped by bot instance (admin only)
+- Shows users organized by which bot instance they interacted with
+- Active bots marked with ✅
+- Inactive/deleted bots marked with ⚠️ (users should be pruned)
+- **Individual user management**:
+  - Delete individual users with confirmation
+  - View user details (ID, username, name, notification status, block status)
+- **Bulk operations**:
+  - Delete all users from a specific bot instance
+- **Pagination**: 10 users per page
+- **Use case**: Clean up users from old/deleted bot instances
+
+### `/prunebots`
+Prune users from inactive/deleted bots (admin only)
+- **Preview mode** (default): Shows what would be deleted without actually deleting
+- **Execute mode**: Use confirmation button to actually delete
+- Automatically removes:
+  - Users from inactive bot instances
+  - Products posted by inactive bots
+  - Pending notifications for those users
+  - Queued custom messages
+- **Safety**: Preserves all data from active bots
+- **Use case**: Run after replacing or removing bot tokens
 
 ### `/nuke`
 Delete ALL products from catalog (admin only)
@@ -224,7 +251,7 @@ _(No subcategories)_
 
 > **Note:** Products in ANNOUNCEMENTS, DATEDPROOFS, and CLIENTTOUCHDOWNS categories are **excluded from the "All Products" view** and can only be accessed by browsing their specific category.
 > 
-> **Important:** ANNOUNCEMENTS category **WILL trigger notifications** to subscribed users, while DATEDPROOFS and CLIENTTOUCHDOWNS will NOT.
+> **Important:** All categories **WILL trigger notifications** to subscribed users.
 
 ## Tips for Admins
 
